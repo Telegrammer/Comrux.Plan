@@ -1,0 +1,16 @@
+name: chat
+
+services:
+  pg:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: chat
+      POSTGRES_USER: chat
+      POSTGRES_PASSWORD: chat
+    ports:
+      - "5453:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "chat", "-d", "chat"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
