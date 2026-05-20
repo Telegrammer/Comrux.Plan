@@ -9,7 +9,7 @@ from application.ports.gateways import (
     ChatMembershipCommandGateway,
     ChatMembershipQueryGateway,
 )
-from domain.entities.actor import ActorId
+from domain.entities.actor import Actor, ActorId
 from domain.entities.chat import ChatId, ChatMembership
 from domain.services import ChatService
 
@@ -29,16 +29,20 @@ class AddChatMemberResponse:
     chat_id: ChatId
     actor_id: ActorId
     joined_at: datetime
+    display_name: str
+    public_id: str
     was_added: bool
 
     @classmethod
     def from_entity(
-        cls, membership: ChatMembership, was_added: bool
+        cls, membership: ChatMembership, actor: Actor, was_added: bool
     ) -> "AddChatMemberResponse":
         return cls(
             chat_id=membership.chat,
             actor_id=membership.actor,
             joined_at=membership.joined_at,
+            display_name=actor.display_name.value,
+            public_id=actor.public_id,
             was_added=was_added,
         )
 
@@ -68,7 +72,9 @@ class AddChatMemberUsecase:
             request.actor_id,
         )
         if existing_membership is not None:
-            return AddChatMemberResponse.from_entity(existing_membership, was_added=False)
+            return AddChatMemberResponse.from_entity(
+                existing_membership, actor=actor, was_added=False
+            )
 
         membership = self._chat_service.create_membership(
             chat_id=request.chat_id,
@@ -76,4 +82,4 @@ class AddChatMemberUsecase:
             now=self._clock.now(),
         )
         await self._membership_commands.add(membership)
-        return AddChatMemberResponse.from_entity(membership, was_added=True)
+        return AddChatMemberResponse.from_entity(membership, actor=actor, was_added=True)

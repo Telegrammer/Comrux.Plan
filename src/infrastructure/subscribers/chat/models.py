@@ -21,3 +21,27 @@ class ProjectMemberAdded(BaseModel):
     member_id: str
 
     model_config = {"extra": "ignore"}
+
+
+class ProjectMemberRemoved(BaseModel):
+    project_id: str
+    member_id: str
+
+    model_config = {"extra": "ignore"}
+
+
+class ProjectTaskCreated(BaseModel):
+    project_id: str
+    task_id: str
+    title: str | None = None
+
+    model_config = {"extra": "ignore"}
+
+
+class ProjectTaskStatusChanged(BaseModel):
+    project_id: str
+    task_id: str
+    status: str
+    title: str | None = None
+
+    model_config = {"extra": "ignore"}

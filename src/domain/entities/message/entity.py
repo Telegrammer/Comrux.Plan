@@ -16,8 +16,14 @@ class Message(Entity[MessageId]):
     author_kind: MessageAuthorKind
     author_id: ActorId | None = None
     reply_to_message_id: MessageId | None = None
+    runtime_id: str | None = None
 
 
 @dataclass
 class SystemMessage(Message):
     author_kind: MessageAuthorKind = MessageAuthorKind.SYSTEM
+
+
+@dataclass
+class UserMessage(Message):
+    author_kind: MessageAuthorKind = MessageAuthorKind.USER

@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING
 from uuid import UUID
 from datetime import datetime
 
-from sqlalchemy import ForeignKey
+from sqlalchemy import DateTime, ForeignKey
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .base import Base
@@ -21,7 +21,7 @@ class ChatMembership(Base):
     actor_id: Mapped[UUID] = mapped_column(
         ForeignKey("actors.id", ondelete="CASCADE"), primary_key=True
     )
-    joined_at: Mapped[datetime] = mapped_column(nullable=False)
+    joined_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
     chat: Mapped[Chat] = relationship(back_populates="members")
     actor: Mapped[Actor] = relationship(back_populates="memberships")

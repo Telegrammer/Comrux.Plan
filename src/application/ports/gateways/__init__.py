@@ -5,4 +5,4 @@ from .actor import (
     ChatMembershipQueryGateway,
 )
 from .chat import ChatCommandGateway, ChatQueryGateway
-from .message import MessageCommandGateway
+from .message import DurableMessageCommandGateway, MessageCommandGateway, MessageQueryGateway

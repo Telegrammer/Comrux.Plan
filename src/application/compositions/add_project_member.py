@@ -16,7 +16,10 @@ from domain.entities.chat import ChatId
 logger = logging.getLogger(__name__)
 
 SYSTEM_CHAT_CREATED_MESSAGE = "Chat created"
-SYSTEM_MEMBER_ADDED_MESSAGE = "Member added"
+
+
+def _build_member_added_message(*, display_name: str, public_id: str) -> str:
+    return f"Member added: public_id={public_id}, display_name={display_name}"
 
 
 @dataclass(frozen=True)
@@ -74,7 +77,10 @@ class AddProjectMemberComposition:
                 await self._create_system_message(
                     CreateSystemMessageRequest(
                         chat_id=chat_response.chat_id,
-                        content=SYSTEM_MEMBER_ADDED_MESSAGE,
+                        content=_build_member_added_message(
+                            display_name=member_response.display_name,
+                            public_id=member_response.public_id,
+                        ),
                     )
                 )
 

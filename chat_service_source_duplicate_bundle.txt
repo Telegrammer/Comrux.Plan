@@ -1,0 +1,5902 @@
+src/alembic/env.py
+
+import asyncio
+from logging.config import fileConfig
+
+from alembic import context
+from sqlalchemy import pool
+from sqlalchemy.engine import Connection
+from sqlalchemy.ext.asyncio import async_engine_from_config
+
+from infrastructure.models import Base
+from setup import settings
+
+config = context.config
+
+if config.config_file_name is not None:
+    fileConfig(config.config_file_name)
+
+target_metadata = Base.metadata
+config.set_main_option("sqlalchemy.url", str(settings.db.url))
+
+
+def run_migrations_offline() -> None:
+    url = config.get_main_option("sqlalchemy.url")
+    context.configure(
+        url=url,
+        target_metadata=target_metadata,
+        literal_binds=True,
+        dialect_opts={"paramstyle": "named"},
+    )
+
+    with context.begin_transaction():
+        context.run_migrations()
+
+
+def do_run_migrations(connection: Connection) -> None:
+    context.configure(connection=connection, target_metadata=target_metadata)
+
+    with context.begin_transaction():
+        context.run_migrations()
+
+
+async def run_async_migrations() -> None:
+    connectable = async_engine_from_config(
+        config.get_section(config.config_ini_section, {}),
+        prefix="sqlalchemy.",
+        poolclass=pool.NullPool,
+    )
+
+    async with connectable.connect() as connection:
+        await connection.run_sync(do_run_migrations)
+
+    await connectable.dispose()
+
+
+def run_migrations_online() -> None:
+    asyncio.run(run_async_migrations())
+
+
+if context.is_offline_mode():
+    run_migrations_offline()
+else:
+    run_migrations_online()
+
+src/alembic/versions/20260412_0001_create_chat_tables.py
+
+"""create chat tables
+
+Revision ID: 20260412_0001
+Revises:
+Create Date: 2026-04-12 00:01:00
+"""
+
+from collections.abc import Sequence
+
+import sqlalchemy as sa
+from alembic import op
+
+revision: str = "20260412_0001"
+down_revision: str | None = None
+branch_labels: Sequence[str] | None = None
+depends_on: Sequence[str] | None = None
+
+
+def upgrade() -> None:
+    author_kind = sa.Enum("USER", "BOT", "SYSTEM", name="messageauthorkind")
+
+    op.create_table(
+        "actors",
+        sa.Column("id", sa.UUID(), nullable=False),
+        sa.Column("display_name", sa.String(length=100), nullable=False),
+        sa.Column("public_id", sa.String(length=255), nullable=False),
+        sa.PrimaryKeyConstraint("id", name=op.f("pk_actors")),
+        sa.UniqueConstraint("public_id", name=op.f("uq_actors_public_id")),
+    )
+
+    op.create_table(
+        "chats",
+        sa.Column("id", sa.UUID(), nullable=False),
+        sa.Column("name", sa.String(length=255), nullable=True),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("context_kind", sa.String(length=50), nullable=False),
+        sa.Column("context_external_id", sa.String(length=255), nullable=False),
+        sa.PrimaryKeyConstraint("id", name=op.f("pk_chats")),
+        sa.UniqueConstraint(
+            "context_kind",
+            "context_external_id",
+            name=op.f("uq_chats_context_kind_context_external_id"),
+        ),
+    )
+
+    op.create_table(
+        "chat_memberships",
+        sa.Column("chat_id", sa.UUID(), nullable=False),
+        sa.Column("actor_id", sa.UUID(), nullable=False),
+        sa.Column("joined_at", sa.DateTime(timezone=True), nullable=False),
+        sa.ForeignKeyConstraint(
+            ["actor_id"],
+            ["actors.id"],
+            name=op.f("fk_chat_memberships_actor_id_actors"),
+            ondelete="CASCADE",
+        ),
+        sa.ForeignKeyConstraint(
+            ["chat_id"],
+            ["chats.id"],
+            name=op.f("fk_chat_memberships_chat_id_chats"),
+            ondelete="CASCADE",
+        ),
+        sa.PrimaryKeyConstraint(
+            "chat_id",
+            "actor_id",
+            name=op.f("pk_chat_memberships"),
+        ),
+    )
+
+    op.create_table(
+        "messages",
+        sa.Column("id", sa.Integer(), autoincrement=True, nullable=False),
+        sa.Column("content", sa.LargeBinary(), nullable=False),
+        sa.Column("chat_id", sa.UUID(), nullable=False),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("author_id", sa.UUID(), nullable=True),
+        sa.Column("author_kind", author_kind, nullable=False),
+        sa.Column("reply_to_message_id", sa.Integer(), nullable=True),
+        sa.ForeignKeyConstraint(
+            ["author_id"],
+            ["actors.id"],
+            name=op.f("fk_messages_author_id_actors"),
+            ondelete="SET NULL",
+        ),
+        sa.ForeignKeyConstraint(
+            ["chat_id"],
+            ["chats.id"],
+            name=op.f("fk_messages_chat_id_chats"),
+            ondelete="CASCADE",
+        ),
+        sa.ForeignKeyConstraint(
+            ["reply_to_message_id"],
+            ["messages.id"],
+            name=op.f("fk_messages_reply_to_message_id_messages"),
+            ondelete="SET NULL",
+        ),
+        sa.PrimaryKeyConstraint("id", name=op.f("pk_messages")),
+    )
+    op.create_index(op.f("ix_messages_chat_id"), "messages", ["chat_id"], unique=False)
+    op.create_index(
+        op.f("ix_messages_reply_to_message_id"),
+        "messages",
+        ["reply_to_message_id"],
+        unique=False,
+    )
+
+
+def downgrade() -> None:
+    op.drop_index(op.f("ix_messages_reply_to_message_id"), table_name="messages")
+    op.drop_index(op.f("ix_messages_chat_id"), table_name="messages")
+    op.drop_table("messages")
+    op.drop_table("chat_memberships")
+    op.drop_table("chats")
+    op.drop_table("actors")
+
+src/alembic/versions/20260413_0002_add_runtime_id_to_messages.py
+
+"""add runtime id to messages
+
+Revision ID: 20260413_0002
+Revises: 20260412_0001
+Create Date: 2026-04-13 00:02:00
+"""
+
+from collections.abc import Sequence
+
+import sqlalchemy as sa
+from alembic import op
+
+revision: str = "20260413_0002"
+down_revision: str | None = "20260412_0001"
+branch_labels: Sequence[str] | None = None
+depends_on: Sequence[str] | None = None
+
+
+def upgrade() -> None:
+    op.add_column("messages", sa.Column("runtime_id", sa.String(length=64), nullable=True))
+    op.create_index(op.f("ix_messages_runtime_id"), "messages", ["runtime_id"], unique=True)
+
+
+def downgrade() -> None:
+    op.drop_index(op.f("ix_messages_runtime_id"), table_name="messages")
+    op.drop_column("messages", "runtime_id")
+
+src/app_factory.py
+
+from contextlib import asynccontextmanager
+import logging
+
+from dishka import AsyncContainer, make_async_container
+import dishka.integrations.fastapi as fastapi_integration
+import dishka.integrations.faststream as faststream_integration
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from faststream import ContextRepo, FastStream
+from faststream.kafka import KafkaBroker
+from redis.asyncio import Redis
+
+from application.ports import ChatSessionSavePolicy
+from infrastructure.subscribers.chat import chat_sub_router
+from presentation.http.controllers import chat_http_router
+from presentation.ws.controllers import chat_ws_router
+from setup import DatabaseHelper, Settings, settings
+from setup.providers import (
+    ApplicationProvider,
+    DatabaseProvider,
+    DomainProvider,
+    PresentationProvider,
+    RuntimeProvider,
+)
+
+logger = logging.getLogger(__name__)
+
+
+def create_app() -> FastAPI:
+    broker = KafkaBroker(str(settings.transport.kafka_url).replace("kafka://", ""))
+    container: AsyncContainer = make_async_container(
+        DatabaseProvider(),
+        DomainProvider(),
+        ApplicationProvider(),
+        RuntimeProvider(),
+        PresentationProvider(),
+        context={Settings: settings, KafkaBroker: broker},
+    )
+
+    broker.include_router(chat_sub_router)
+    faststream_integration.setup_dishka(
+        container=container,
+        app=FastStream(broker, context=ContextRepo()),
+    )
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        async with container() as app_state:
+            app.state.container = app_state
+            save_policy = await app_state.get(ChatSessionSavePolicy)
+            await save_policy.start()
+            await broker.start()
+            try:
+                yield
+            finally:
+                await broker.stop()
+                await save_policy.stop()
+
+        db_helper = await container.get(DatabaseHelper)
+        redis = await container.get(Redis)
+        await redis.aclose()
+        await db_helper.dispose()
+
+    app = FastAPI(title="Comrux.Chat", lifespan=lifespan)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+    app.include_router(chat_http_router)
+    app.include_router(chat_ws_router)
+
+    @app.get("/health")
+    async def health() -> dict[str, str]:
+        return {"status": "ok"}
+
+    fastapi_integration.setup_dishka(container=container, app=app)
+    logger.info("Chat app created")
+    return app
+
+src/application/__init__.py
+
+from .compositions import CreateChatComposition
+
+src/application/compositions/__init__.py
+
+from .add_project_member import AddProjectMemberComposition
+from .create_actor import CreateActorComposition
+from .create_chat import CreateChatComposition
+from .create_project_chat import CreateProjectChatComposition
+from .flush_chat_room_messages import (
+    FlushChatRoomMessagesComposition,
+    FlushChatRoomMessagesRequest,
+    FlushChatRoomMessagesResponse,
+)
+from .get_chat_history import (
+    GetChatHistoryComposition,
+    GetChatHistoryCompositionRequest,
+    GetChatHistoryCompositionResponse,
+)
+from .join_chat_membership import (
+    JoinChatMembershipComposition,
+    JoinChatMembershipCompositionRequest,
+    JoinChatMembershipCompositionResponse,
+)
+from .remove_chat_member import (
+    RemoveChatMemberComposition,
+    RemoveChatMemberCompositionRequest,
+    RemoveChatMemberCompositionResponse,
+)
+
+src/application/compositions/add_project_member.py
+
+import logging
+from dataclasses import dataclass
+
+from application.ports import UnitOfWork
+from application.usecases import (
+    AddChatMemberRequest,
+    AddChatMemberUsecase,
+    CreateChatRequest,
+    CreateChatUsecase,
+    CreateSystemMessageRequest,
+    CreateSystemMessageUsecase,
+)
+from domain.entities.actor import ActorId
+from domain.entities.chat import ChatId
+
+logger = logging.getLogger(__name__)
+
+SYSTEM_CHAT_CREATED_MESSAGE = "Chat created"
+
+
+def _build_member_added_message(*, display_name: str, public_id: str) -> str:
+    return f"Member added: public_id={public_id}, display_name={display_name}"
+
+
+@dataclass(frozen=True)
+class AddProjectMemberRequest:
+    chat: CreateChatRequest
+    actor_id: ActorId
+
+
+@dataclass(frozen=True)
+class AddProjectMemberResponse:
+    chat_id: ChatId
+    chat_was_created: bool
+    member_was_added: bool
+
+
+class AddProjectMemberComposition:
+    def __init__(
+        self,
+        create_chat: CreateChatUsecase,
+        add_chat_member: AddChatMemberUsecase,
+        create_system_message: CreateSystemMessageUsecase,
+        unit_of_work: UnitOfWork,
+    ) -> None:
+        self._create_chat = create_chat
+        self._add_chat_member = add_chat_member
+        self._create_system_message = create_system_message
+        self._unit_of_work = unit_of_work
+
+    async def __call__(
+        self, request: AddProjectMemberRequest
+    ) -> AddProjectMemberResponse:
+        logger.info(
+            "Project member add started for %s:%s actor=%s",
+            request.chat.context.kind.value,
+            request.chat.context.external_id,
+            request.actor_id.value,
+        )
+
+        async with self._unit_of_work:
+            chat_response = await self._create_chat(request.chat)
+            member_response = await self._add_chat_member(
+                AddChatMemberRequest(
+                    chat_id=chat_response.chat_id,
+                    actor_id=request.actor_id,
+                )
+            )
+            if chat_response.was_created:
+                await self._create_system_message(
+                    CreateSystemMessageRequest(
+                        chat_id=chat_response.chat_id,
+                        content=SYSTEM_CHAT_CREATED_MESSAGE,
+                    )
+                )
+            if member_response.was_added:
+                await self._create_system_message(
+                    CreateSystemMessageRequest(
+                        chat_id=chat_response.chat_id,
+                        content=_build_member_added_message(
+                            display_name=member_response.display_name,
+                            public_id=member_response.public_id,
+                        ),
+                    )
+                )
+
+        logger.info(
+            "Project member flow done for chat %s (chat_created=%s, member_added=%s)",
+            chat_response.chat_id.value,
+            chat_response.was_created,
+            member_response.was_added,
+        )
+        return AddProjectMemberResponse(
+            chat_id=chat_response.chat_id,
+            chat_was_created=chat_response.was_created,
+            member_was_added=member_response.was_added,
+        )
+
+src/application/compositions/create_actor.py
+
+import logging
+
+from application.ports import UnitOfWork
+from application.usecases import CreateActorRequest, CreateActorResponse, CreateActorUsecase
+
+logger = logging.getLogger(__name__)
+
+
+class CreateActorComposition:
+    def __init__(self, usecase: CreateActorUsecase, unit_of_work: UnitOfWork) -> None:
+        self._usecase = usecase
+        self._unit_of_work = unit_of_work
+
+    async def __call__(self, request: CreateActorRequest) -> CreateActorResponse:
+        logger.info("Actor creation started for %s", request.actor_id.value)
+        async with self._unit_of_work:
+            response = await self._usecase(request)
+        if response.was_created:
+            logger.info("Actor %s created", response.actor_id.value)
+        else:
+            logger.info("Actor %s already exists", response.actor_id.value)
+        return response
+
+src/application/compositions/create_chat.py
+
+import logging
+
+from application.ports import UnitOfWork
+from application.usecases import (
+    CreateChatRequest,
+    CreateChatResponse,
+    CreateChatUsecase,
+    CreateSystemMessageRequest,
+    CreateSystemMessageUsecase,
+)
+
+logger = logging.getLogger(__name__)
+
+SYSTEM_CHAT_CREATED_MESSAGE = "Chat created"
+
+
+class CreateChatComposition:
+    def __init__(
+        self,
+        create_chat: CreateChatUsecase,
+        create_system_message: CreateSystemMessageUsecase,
+        unit_of_work: UnitOfWork,
+    ) -> None:
+        self._create_chat = create_chat
+        self._create_system_message = create_system_message
+        self._unit_of_work = unit_of_work
+
+    async def __call__(self, request: CreateChatRequest) -> CreateChatResponse:
+        logger.info(
+            "Chat creation started for %s:%s",
+            request.context.kind.value,
+            request.context.external_id,
+        )
+
+        async with self._unit_of_work:
+            response = await self._create_chat(request)
+            if response.was_created:
+                await self._create_system_message(
+                    CreateSystemMessageRequest(
+                        chat_id=response.chat_id,
+                        content=SYSTEM_CHAT_CREATED_MESSAGE,
+                    )
+                )
+
+        if response.was_created:
+            logger.info("Chat %s created successfully", response.chat_id.value)
+        else:
+            logger.info(
+                "Chat for %s:%s already exists",
+                request.context.kind.value,
+                request.context.external_id,
+            )
+        return response
+
+src/application/compositions/create_project_chat.py
+
+import logging
+from dataclasses import dataclass
+
+from application.ports import UnitOfWork
+from application.usecases import (
+    AddChatMemberRequest,
+    AddChatMemberUsecase,
+    CreateChatRequest,
+    CreateChatUsecase,
+    CreateSystemMessageRequest,
+    CreateSystemMessageUsecase,
+)
+from domain.entities.actor import ActorId
+from domain.entities.chat import ChatId
+
+logger = logging.getLogger(__name__)
+
+SYSTEM_CHAT_CREATED_MESSAGE = "Chat created"
+
+
+@dataclass(frozen=True)
+class CreateProjectChatRequest:
+    chat: CreateChatRequest
+    owner_id: ActorId
+
+
+@dataclass(frozen=True)
+class CreateProjectChatResponse:
+    chat_id: ChatId
+    chat_was_created: bool
+    owner_was_added: bool
+
+
+class CreateProjectChatComposition:
+    def __init__(
+        self,
+        create_chat: CreateChatUsecase,
+        add_chat_member: AddChatMemberUsecase,
+        create_system_message: CreateSystemMessageUsecase,
+        unit_of_work: UnitOfWork,
+    ) -> None:
+        self._create_chat = create_chat
+        self._add_chat_member = add_chat_member
+        self._create_system_message = create_system_message
+        self._unit_of_work = unit_of_work
+
+    async def __call__(
+        self, request: CreateProjectChatRequest
+    ) -> CreateProjectChatResponse:
+        logger.info(
+            "Project chat creation started for %s:%s",
+            request.chat.context.kind.value,
+            request.chat.context.external_id,
+        )
+
+        async with self._unit_of_work:
+            chat_response = await self._create_chat(request.chat)
+            owner_response = await self._add_chat_member(
+                AddChatMemberRequest(
+                    chat_id=chat_response.chat_id,
+                    actor_id=request.owner_id,
+                )
+            )
+            if chat_response.was_created:
+                await self._create_system_message(
+                    CreateSystemMessageRequest(
+                        chat_id=chat_response.chat_id,
+                        content=SYSTEM_CHAT_CREATED_MESSAGE,
+                    )
+                )
+
+        logger.info(
+            "Project chat %s ready (created=%s, owner_added=%s)",
+            chat_response.chat_id.value,
+            chat_response.was_created,
+            owner_response.was_added,
+        )
+        return CreateProjectChatResponse(
+            chat_id=chat_response.chat_id,
+            chat_was_created=chat_response.was_created,
+            owner_was_added=owner_response.was_added,
+        )
+
+src/application/compositions/flush_chat_room_messages.py
+
+from dataclasses import dataclass
+
+from application.ports import ChatMessage, UnitOfWork
+from application.ports.gateways import MessageCommandGateway
+from domain.services import MessageService
+
+
+@dataclass(frozen=True)
+class FlushChatRoomMessagesRequest:
+    messages: list[ChatMessage]
+
+
+@dataclass(frozen=True)
+class FlushChatRoomMessagesResponse:
+    persisted_runtime_ids: list[str]
+
+
+class FlushChatRoomMessagesComposition:
+    def __init__(
+        self,
+        message_commands: MessageCommandGateway,
+        message_service: MessageService,
+        unit_of_work: UnitOfWork,
+    ) -> None:
+        self._message_commands = message_commands
+        self._message_service = message_service
+        self._unit_of_work = unit_of_work
+
+    async def __call__(
+        self, request: FlushChatRoomMessagesRequest
+    ) -> FlushChatRoomMessagesResponse:
+        if not request.messages:
+            return FlushChatRoomMessagesResponse(persisted_runtime_ids=[])
+
+        messages = [
+            self._message_service.create_user_message(
+                content=item.content,
+                chat_id=item.chat_id,
+                author_id=item.author_id,
+                now=item.created_at,
+                reply_to_message_id=item.reply_to_message_id,
+                runtime_id=item.runtime_id,
+            )
+            for item in request.messages
+        ]
+
+        async with self._unit_of_work:
+            await self._message_commands.add_many(messages)
+
+        return FlushChatRoomMessagesResponse(
+            persisted_runtime_ids=[item.runtime_id for item in request.messages]
+        )
+
+src/application/compositions/get_chat_history.py
+
+import logging
+from dataclasses import dataclass
+from datetime import datetime
+
+from application.ports import ChatMessage, UnitOfWork
+from application.usecases import (
+    GetChatHistoryRequest,
+    GetChatHistoryUsecase,
+    RequireChatAccessRequest,
+    RequireChatAccessUsecase,
+)
+from domain.entities.actor import ActorId
+from domain.entities.chat import ChatId
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class GetChatHistoryCompositionRequest:
+    chat_id: ChatId
+    actor_id: ActorId
+    limit: int
+    before_created_at: datetime | None = None
+    before_message_id: int | None = None
+
+
+@dataclass(frozen=True)
+class GetChatHistoryCompositionResponse:
+    messages: list[ChatMessage]
+    has_more: bool
+    next_before_created_at: datetime | None
+    next_before_message_id: int | None
+
+
+class GetChatHistoryComposition:
+    def __init__(
+        self,
+        require_access: RequireChatAccessUsecase,
+        get_history: GetChatHistoryUsecase,
+        unit_of_work: UnitOfWork,
+    ) -> None:
+        self._require_access = require_access
+        self._get_history = get_history
+        self._unit_of_work = unit_of_work
+
+    async def __call__(
+        self, request: GetChatHistoryCompositionRequest
+    ) -> GetChatHistoryCompositionResponse:
+        logger.info(
+            "Chat history loading started for chat=%s actor=%s limit=%s",
+            request.chat_id.value,
+            request.actor_id.value,
+            request.limit,
+        )
+        async with self._unit_of_work:
+            await self._require_access(
+                RequireChatAccessRequest(
+                    chat_id=request.chat_id,
+                    actor_id=request.actor_id,
+                )
+            )
+            response = await self._get_history(
+                GetChatHistoryRequest(
+                    chat_id=request.chat_id,
+                    limit=request.limit,
+                    before_created_at=request.before_created_at,
+                    before_message_id=request.before_message_id,
+                )
+            )
+
+        logger.info(
+            "Chat history loaded for chat=%s actor=%s messages=%s has_more=%s",
+            request.chat_id.value,
+            request.actor_id.value,
+            len(response.messages),
+            response.has_more,
+        )
+        return GetChatHistoryCompositionResponse(
+            messages=response.messages,
+            has_more=response.has_more,
+            next_before_created_at=response.next_before_created_at,
+            next_before_message_id=response.next_before_message_id,
+        )
+
+src/application/compositions/join_chat_membership.py
+
+import logging
+from dataclasses import dataclass
+
+from application.ports import UnitOfWork
+from application.usecases import (
+    AddChatMemberRequest,
+    AddChatMemberUsecase,
+    CreateChatRequest,
+    CreateChatUsecase,
+    CreateSystemMessageRequest,
+    CreateSystemMessageUsecase,
+)
+from domain.entities.actor import ActorId
+from domain.entities.chat import ChatId, ContextRef
+
+logger = logging.getLogger(__name__)
+
+SYSTEM_CHAT_CREATED_MESSAGE = "Chat created"
+
+
+def _build_member_added_message(*, display_name: str, public_id: str) -> str:
+    return f"Member added: public_id={public_id}, display_name={display_name}"
+
+
+@dataclass(frozen=True)
+class JoinChatMembershipCompositionRequest:
+    context: ContextRef
+    actor_id: ActorId
+
+
+@dataclass(frozen=True)
+class JoinChatMembershipCompositionResponse:
+    chat_id: ChatId
+    chat_was_created: bool
+    member_was_added: bool
+
+
+class JoinChatMembershipComposition:
+    def __init__(
+        self,
+        create_chat: CreateChatUsecase,
+        add_chat_member: AddChatMemberUsecase,
+        create_system_message: CreateSystemMessageUsecase,
+        unit_of_work: UnitOfWork,
+    ) -> None:
+        self._create_chat = create_chat
+        self._add_chat_member = add_chat_member
+        self._create_system_message = create_system_message
+        self._unit_of_work = unit_of_work
+
+    async def __call__(
+        self, request: JoinChatMembershipCompositionRequest
+    ) -> JoinChatMembershipCompositionResponse:
+        logger.info(
+            "Chat membership join started for %s:%s actor=%s",
+            request.context.kind.value,
+            request.context.external_id,
+            request.actor_id.value,
+        )
+        async with self._unit_of_work:
+            chat_response = await self._create_chat(
+                CreateChatRequest(name=None, context=request.context)
+            )
+            member_response = await self._add_chat_member(
+                AddChatMemberRequest(
+                    chat_id=chat_response.chat_id,
+                    actor_id=request.actor_id,
+                )
+            )
+            if chat_response.was_created:
+                await self._create_system_message(
+                    CreateSystemMessageRequest(
+                        chat_id=chat_response.chat_id,
+                        content=SYSTEM_CHAT_CREATED_MESSAGE,
+                    )
+                )
+            if member_response.was_added:
+                await self._create_system_message(
+                    CreateSystemMessageRequest(
+                        chat_id=chat_response.chat_id,
+                        content=_build_member_added_message(
+                            display_name=member_response.display_name,
+                            public_id=member_response.public_id,
+                        ),
+                    )
+                )
+
+        logger.info(
+            "Chat membership join finished for chat=%s actor=%s (chat_created=%s, member_added=%s)",
+            chat_response.chat_id.value,
+            request.actor_id.value,
+            chat_response.was_created,
+            member_response.was_added,
+        )
+        return JoinChatMembershipCompositionResponse(
+            chat_id=chat_response.chat_id,
+            chat_was_created=chat_response.was_created,
+            member_was_added=member_response.was_added,
+        )
+
+src/application/compositions/remove_chat_member.py
+
+import logging
+from dataclasses import dataclass
+
+from application.exceptions import ChatNotFoundError
+from application.ports import ChatRoomRegistry, UnitOfWork
+from application.ports.gateways import ChatQueryGateway
+from application.services import ChatRoomSaver
+from application.usecases import (
+    CreateSystemMessageRequest,
+    CreateSystemMessageUsecase,
+    RemoveChatMemberRequest,
+    RemoveChatMemberUsecase,
+)
+from domain.entities.actor import ActorId
+from domain.entities.chat import ChatId, ContextRef
+
+logger = logging.getLogger(__name__)
+
+
+def _build_member_left_message(
+    *, display_name: str, public_id: str, name: str
+) -> str:
+    return (
+        "Member left: "
+        f"name={name}, public_id={public_id}, display_name={display_name}"
+    )
+
+
+@dataclass(frozen=True)
+class RemoveChatMemberCompositionRequest:
+    context: ContextRef
+    actor_id: ActorId
+
+
+@dataclass(frozen=True)
+class RemoveChatMemberCompositionResponse:
+    chat_id: ChatId
+    member_was_removed: bool
+    display_name: str
+    public_id: str
+    name: str
+
+
+class RemoveChatMemberComposition:
+    def __init__(
+        self,
+        chat_queries: ChatQueryGateway,
+        remove_chat_member: RemoveChatMemberUsecase,
+        create_system_message: CreateSystemMessageUsecase,
+        room_saver: ChatRoomSaver,
+        room_registry: ChatRoomRegistry,
+        unit_of_work: UnitOfWork,
+    ) -> None:
+        self._chat_queries = chat_queries
+        self._remove_chat_member = remove_chat_member
+        self._create_system_message = create_system_message
+        self._room_saver = room_saver
+        self._room_registry = room_registry
+        self._unit_of_work = unit_of_work
+
+    async def __call__(
+        self, request: RemoveChatMemberCompositionRequest
+    ) -> RemoveChatMemberCompositionResponse:
+        logger.info(
+            "Chat membership remove started for %s:%s actor=%s",
+            request.context.kind.value,
+            request.context.external_id,
+            request.actor_id.value,
+        )
+
+        async with self._unit_of_work:
+            chat = await self._chat_queries.by_context(request.context)
+            if chat is None:
+                raise ChatNotFoundError(
+                    "Chat for "
+                    f"{request.context.kind.value}:{request.context.external_id} was not found"
+                )
+
+            member_response = await self._remove_chat_member(
+                RemoveChatMemberRequest(chat_id=chat.id, actor_id=request.actor_id)
+            )
+            if member_response.was_removed:
+                await self._create_system_message(
+                    CreateSystemMessageRequest(
+                        chat_id=chat.id,
+                        content=_build_member_left_message(
+                            display_name=member_response.display_name,
+                            public_id=member_response.public_id,
+                            name=member_response.name,
+                        ),
+                    )
+                )
+
+        if member_response.was_removed:
+            await self._room_saver.save_if_dirty(member_response.chat_id)
+            room = await self._room_registry.get(member_response.chat_id)
+            if room is not None:
+                await room.disconnect_actor(request.actor_id)
+
+        logger.info(
+            "Chat membership remove finished for chat=%s actor=%s removed=%s",
+            member_response.chat_id.value,
+            request.actor_id.value,
+            member_response.was_removed,
+        )
+        return RemoveChatMemberCompositionResponse(
+            chat_id=member_response.chat_id,
+            member_was_removed=member_response.was_removed,
+            display_name=member_response.display_name,
+            public_id=member_response.public_id,
+            name=member_response.name,
+        )
+
+src/application/exceptions.py
+
+class ApplicationError(Exception): ...
+
+
+class UsecaseError(ApplicationError): ...
+
+
+class GatewayError(ApplicationError): ...
+
+
+class GatewayFailedError(GatewayError): ...
+
+
+class InconsistentDataError(GatewayError): ...
+
+
+class ActorNotFoundError(UsecaseError): ...
+
+
+class ChatNotFoundError(UsecaseError): ...
+
+
+class ChatMembershipForbiddenError(UsecaseError): ...
+
+
+class InvalidChatCommandError(UsecaseError): ...
+
+
+class ConnectionClosedError(ApplicationError): ...
+
+src/application/ports/__init__.py
+
+from .chat_events import (
+    ChatClientJoinedEvent,
+    ChatClientLeftEvent,
+    ChatRoomEvent,
+    ChatRoomEventListener,
+    ChatRoomEventPublisher,
+    ChatRoomModifiedEvent,
+)
+from .chat_session import (
+    ChatConnection,
+    ChatErrorEvent,
+    ChatHistoryEvent,
+    ChatMemberJoinedEvent,
+    ChatMemberLeftEvent,
+    ChatMessage,
+    ChatMessageCreatedEvent,
+    ChatRoom,
+    ChatRoomFactory,
+    ChatRoomRegistry,
+    ChatRuntimeStore,
+    ChatSessionSavePolicy,
+    ChatSessionCommand,
+    ChatSessionEvent,
+    PingCommand,
+    PongEvent,
+    SendChatMessageCommand,
+)
+from .clock import Clock
+from .transaction import Transaction
+from .unit_of_work import UnitOfWork
+
+src/application/ports/chat_events.py
+
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+
+from domain.entities.actor import Actor
+from domain.entities.chat import ChatId
+
+
+@dataclass(frozen=True)
+class ChatRoomEvent(ABC):
+    chat_id: ChatId
+
+    @abstractmethod
+    async def accept(self, listener: "ChatRoomEventListener") -> None:
+        raise NotImplementedError
+
+
+@dataclass(frozen=True)
+class ChatActorEvent(ChatRoomEvent, ABC):
+    actor: Actor
+
+
+@dataclass(frozen=True)
+class ChatClientJoinedEvent(ChatActorEvent):
+    async def accept(self, listener: "ChatRoomEventListener") -> None:
+        await listener.on_client_joined(self)
+
+
+@dataclass(frozen=True)
+class ChatClientLeftEvent(ChatActorEvent):
+    async def accept(self, listener: "ChatRoomEventListener") -> None:
+        await listener.on_client_left(self)
+
+
+@dataclass(frozen=True)
+class ChatRoomModifiedEvent(ChatRoomEvent):
+    async def accept(self, listener: "ChatRoomEventListener") -> None:
+        await listener.on_room_modified(self)
+
+
+class ChatRoomEventListener(ABC):
+    @abstractmethod
+    async def on_client_joined(self, event: ChatClientJoinedEvent) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def on_client_left(self, event: ChatClientLeftEvent) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def on_room_modified(self, event: ChatRoomModifiedEvent) -> None:
+        raise NotImplementedError
+
+
+class ChatRoomEventPublisher(ABC):
+    @abstractmethod
+    def subscribe(self, listener: ChatRoomEventListener) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def publish_client_joined(self, chat_id: ChatId, actor: Actor) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def publish_client_left(self, chat_id: ChatId, actor: Actor) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def publish_room_modified(self, chat_id: ChatId) -> None:
+        raise NotImplementedError
+
+src/application/ports/chat_session.py
+
+from abc import ABC
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Protocol
+
+from domain.entities.actor import Actor, ActorId
+from domain.entities.chat import ChatId
+from domain.entities.message import MessageAuthorKind, MessageId
+
+
+@dataclass(frozen=True)
+class ChatMessage:
+    chat_id: ChatId
+    content: str
+    created_at: datetime
+    author_kind: MessageAuthorKind
+    runtime_id: str | None = None
+    message_id: MessageId | None = None
+    author_id: ActorId | None = None
+    author_display_name: str | None = None
+    reply_to_message_id: MessageId | None = None
+    persisted: bool = False
+
+
+class ChatSessionCommand(ABC): ...
+
+
+@dataclass(frozen=True)
+class PingCommand(ChatSessionCommand): ...
+
+
+@dataclass(frozen=True)
+class SendChatMessageCommand(ChatSessionCommand):
+    content: str
+    reply_to_message_id: MessageId | None = None
+
+
+class ChatSessionEvent(ABC): ...
+
+
+@dataclass(frozen=True)
+class PongEvent(ChatSessionEvent): ...
+
+
+@dataclass(frozen=True)
+class ChatHistoryEvent(ChatSessionEvent):
+    chat_id: ChatId
+    messages: list[ChatMessage]
+
+
+@dataclass(frozen=True)
+class ChatMessageCreatedEvent(ChatSessionEvent):
+    message: ChatMessage
+
+
+@dataclass(frozen=True)
+class ChatMemberJoinedEvent(ChatSessionEvent):
+    chat_id: ChatId
+    actor_id: ActorId
+    display_name: str
+
+
+@dataclass(frozen=True)
+class ChatMemberLeftEvent(ChatSessionEvent):
+    chat_id: ChatId
+    actor_id: ActorId
+    display_name: str
+
+
+@dataclass(frozen=True)
+class ChatErrorEvent(ChatSessionEvent):
+    code: str
+    message: str
+
+
+class ChatConnection(Protocol):
+    async def accept(self) -> None: ...
+
+    async def receive(self) -> ChatSessionCommand: ...
+
+    async def send(self, event: ChatSessionEvent) -> None: ...
+
+    async def close(self) -> None: ...
+
+
+class ChatRoom(Protocol):
+    @property
+    def chat_id(self) -> ChatId: ...
+
+    @property
+    def is_dirty(self) -> bool: ...
+
+    @property
+    def is_empty(self) -> bool: ...
+
+    async def serve(self, actor: Actor, connection: ChatConnection) -> None: ...
+
+    async def pending_messages(self) -> list[ChatMessage]: ...
+
+    async def mark_persisted(self, runtime_ids: list[str]) -> None: ...
+
+    def mark_clean(self) -> None: ...
+
+    async def disconnect_actor(self, actor_id: ActorId) -> int: ...
+
+
+class ChatRoomFactory(Protocol):
+    def create(self, chat_id: ChatId) -> ChatRoom: ...
+
+
+class ChatRoomRegistry(Protocol):
+    async def get(self, chat_id: ChatId) -> ChatRoom | None: ...
+
+    async def register(self, chat_id: ChatId, room: ChatRoom) -> ChatRoom: ...
+
+    async def remove(self, chat_id: ChatId) -> None: ...
+
+    def get_all(self) -> dict[ChatId, ChatRoom]: ...
+
+
+class ChatRuntimeStore(Protocol):
+    async def append_pending_message(self, message: ChatMessage) -> None: ...
+
+    async def list_pending_messages(self, chat_id: ChatId) -> list[ChatMessage]: ...
+
+    async def delete_pending_messages(
+        self, chat_id: ChatId, runtime_ids: list[str]
+    ) -> None: ...
+
+    async def add_active_member(self, chat_id: ChatId, actor_id: ActorId) -> None: ...
+
+    async def remove_active_member(self, chat_id: ChatId, actor_id: ActorId) -> None: ...
+
+    async def clear_room(self, chat_id: ChatId) -> None: ...
+
+
+class ChatSessionSavePolicy(Protocol):
+    async def start(self) -> None: ...
+
+    async def stop(self) -> None: ...
+
+    async def on_room_modified(self, chat_id: ChatId) -> None: ...
+
+    async def on_room_closed(self, chat_id: ChatId) -> None: ...
+
+src/application/ports/clock.py
+
+from datetime import datetime
+from typing import Protocol
+
+
+class Clock(Protocol):
+    def now(self) -> datetime:
+        raise NotImplementedError
+
+src/application/ports/gateways/__init__.py
+
+from .actor import (
+    ActorCommandGateway,
+    ActorQueryGateway,
+    ChatMembershipCommandGateway,
+    ChatMembershipQueryGateway,
+)
+from .chat import ChatCommandGateway, ChatQueryGateway
+from .message import DurableMessageCommandGateway, MessageCommandGateway, MessageQueryGateway
+
+src/application/ports/gateways/actor.py
+
+from typing import Protocol
+
+from domain.entities.actor import Actor, ActorId
+from domain.entities.chat import ChatId, ChatMembership
+
+
+class ActorCommandGateway(Protocol):
+    async def add(self, actor: Actor) -> None:
+        raise NotImplementedError
+
+
+class ActorQueryGateway(Protocol):
+    async def by_id(self, actor_id: ActorId) -> Actor | None:
+        raise NotImplementedError
+
+
+class ChatMembershipCommandGateway(Protocol):
+    async def add(self, membership: ChatMembership) -> None:
+        raise NotImplementedError
+
+    async def remove(self, chat_id: ChatId, actor_id: ActorId) -> None:
+        raise NotImplementedError
+
+
+class ChatMembershipQueryGateway(Protocol):
+    async def by_chat_and_actor(
+        self, chat_id: ChatId, actor_id: ActorId
+    ) -> ChatMembership | None:
+        raise NotImplementedError
+
+src/application/ports/gateways/chat.py
+
+from typing import Protocol
+
+from domain.entities.chat import Chat, ChatId, ContextRef
+
+
+class ChatCommandGateway(Protocol):
+    async def add(self, chat: Chat) -> None:
+        raise NotImplementedError
+
+
+class ChatQueryGateway(Protocol):
+    async def by_id(self, chat_id: ChatId) -> Chat | None:
+        raise NotImplementedError
+
+    async def by_context(self, context: ContextRef) -> Chat | None:
+        raise NotImplementedError
+
+src/application/ports/gateways/message.py
+
+from datetime import datetime
+from typing import Protocol
+
+from application.ports import ChatMessage
+from domain.entities.chat import ChatId
+from domain.entities.message import Message
+
+
+class DurableMessageCommandGateway(Protocol):
+    async def add_many(self, messages: list[Message]) -> None:
+        raise NotImplementedError
+
+
+class MessageCommandGateway(Protocol):
+    async def add(self, message: Message) -> None:
+        raise NotImplementedError
+
+    async def add_many(self, messages: list[Message]) -> None:
+        raise NotImplementedError
+
+
+class MessageQueryGateway(Protocol):
+    async def recent_by_chat(
+        self,
+        chat_id: ChatId,
+        limit: int,
+        before_created_at: datetime | None = None,
+        before_message_id: int | None = None,
+    ) -> list[ChatMessage]:
+        raise NotImplementedError
+
+src/application/ports/mappers/__init__.py
+
+from .chat import ChatMapper
+from .message import ChatMessageMapper, DomainMessageMapper
+
+src/application/ports/mappers/chat.py
+
+from typing import Protocol
+from domain.entities.chat import Chat
+
+
+class ChatMapper[dtoT](Protocol):
+    def to_dto(self, domain: Chat) -> dtoT:
+        raise NotImplementedError
+
+    def to_domain(self, dto: dtoT) -> Chat:
+        raise NotImplementedError
+
+src/application/ports/mappers/message.py
+
+from typing import Protocol
+
+from application.ports import ChatMessage
+from domain.entities.message import Message
+
+
+class DomainMessageMapper[dtoT](Protocol):
+    def to_dto(self, domain: Message) -> dtoT:
+        raise NotImplementedError
+
+    def to_domain(self, dto: dtoT) -> Message:
+        raise NotImplementedError
+
+
+class ChatMessageMapper[dtoT](Protocol):
+    def to_dto(self, message: ChatMessage) -> dtoT:
+        raise NotImplementedError
+
+    def to_message(self, dto: dtoT) -> ChatMessage:
+        raise NotImplementedError
+
+src/application/ports/transaction.py
+
+from abc import ABC, abstractmethod
+
+
+class Transaction(ABC):
+    @abstractmethod
+    async def complete(self) -> None: ...
+
+    @abstractmethod
+    async def cancel(self) -> None: ...
+
+src/application/ports/unit_of_work.py
+
+from abc import ABC, abstractmethod
+from typing import Type
+
+from .transaction import Transaction
+
+
+class UnitOfWork(ABC):
+    @abstractmethod
+    def add(self, transaction: Transaction) -> None: ...
+
+    @abstractmethod
+    async def __aenter__(self) -> "UnitOfWork": ...
+
+    @abstractmethod
+    async def __aexit__(
+        self,
+        exc_type: Type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: BaseException | None,
+    ) -> None: ...
+
+src/application/services/__init__.py
+
+from .chat_room_lifecycle import ChatRoomLifecycleHandler
+from .chat_room_presence import ChatRoomPresenceHandler
+from .chat_room_saver import ChatRoomSaver
+
+src/application/services/chat_room_finalizer.py
+
+from application.ports import ChatRoomRegistry, ChatRuntimeStore, ChatSessionSavePolicy
+from domain.entities.chat import ChatId
+
+from .chat_room_saver import ChatRoomSaver
+
+
+class ChatRoomFinalizer:
+    def __init__(
+        self,
+        saver: ChatRoomSaver,
+        registry: ChatRoomRegistry,
+        runtime_store: ChatRuntimeStore,
+        save_policy: ChatSessionSavePolicy,
+    ) -> None:
+        self._saver = saver
+        self._registry = registry
+        self._runtime_store = runtime_store
+        self._save_policy = save_policy
+
+    async def finalize(self, chat_id: ChatId) -> None:
+        await self._saver.save_if_dirty(chat_id)
+        await self._save_policy.on_room_closed(chat_id)
+        await self._runtime_store.clear_room(chat_id)
+        await self._registry.remove(chat_id)
+
+src/application/services/chat_room_lifecycle.py
+
+import logging
+
+from application.ports import (
+    ChatClientJoinedEvent,
+    ChatClientLeftEvent,
+    ChatRoomEventListener,
+    ChatRoomModifiedEvent,
+    ChatRoomRegistry,
+    ChatRuntimeStore,
+    ChatSessionSavePolicy,
+)
+
+from .chat_room_saver import ChatRoomSaver
+
+logger = logging.getLogger(__name__)
+
+
+class ChatRoomLifecycleHandler(ChatRoomEventListener):
+    def __init__(
+        self,
+        registry: ChatRoomRegistry,
+        runtime_store: ChatRuntimeStore,
+        saver: ChatRoomSaver,
+        save_policy: ChatSessionSavePolicy,
+    ) -> None:
+        self._registry = registry
+        self._runtime_store = runtime_store
+        self._saver = saver
+        self._save_policy = save_policy
+
+    async def on_client_joined(self, event: ChatClientJoinedEvent) -> None:
+        return None
+
+    async def on_client_left(self, event: ChatClientLeftEvent) -> None:
+        room = await self._registry.get(event.chat_id)
+        if room is None or not room.is_empty:
+            return
+
+        try:
+            await self._save_policy.on_room_closed(event.chat_id)
+            await self._saver.save_if_dirty(event.chat_id)
+        except Exception:
+            logger.exception("Failed to finalize chat room %s", event.chat_id.value)
+        finally:
+            await self._runtime_store.clear_room(event.chat_id)
+            await self._registry.remove(event.chat_id)
+
+    async def on_room_modified(self, event: ChatRoomModifiedEvent) -> None:
+        await self._save_policy.on_room_modified(event.chat_id)
+
+src/application/services/chat_room_presence.py
+
+from application.ports import (
+    ChatClientJoinedEvent,
+    ChatClientLeftEvent,
+    ChatRoomEventListener,
+    ChatRoomModifiedEvent,
+    ChatRuntimeStore,
+)
+
+
+class ChatRoomPresenceHandler(ChatRoomEventListener):
+    def __init__(self, runtime_store: ChatRuntimeStore) -> None:
+        self._runtime_store = runtime_store
+
+    async def on_client_joined(self, event: ChatClientJoinedEvent) -> None:
+        await self._runtime_store.add_active_member(event.chat_id, event.actor.id)
+
+    async def on_client_left(self, event: ChatClientLeftEvent) -> None:
+        await self._runtime_store.remove_active_member(event.chat_id, event.actor.id)
+
+    async def on_room_modified(self, event: ChatRoomModifiedEvent) -> None:
+        return None
+
+src/application/services/chat_room_saver.py
+
+import asyncio
+import weakref
+
+from application.ports import ChatRoomRegistry
+from application.ports.gateways import DurableMessageCommandGateway
+from domain.entities.chat import ChatId
+from domain.services import MessageService
+
+
+class ChatRoomSaver:
+    def __init__(
+        self,
+        registry: ChatRoomRegistry,
+        message_service: MessageService,
+        message_commands: DurableMessageCommandGateway,
+    ) -> None:
+        self._registry = registry
+        self._message_service = message_service
+        self._message_commands = message_commands
+        self._locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+            weakref.WeakValueDictionary()
+        )
+
+    async def save_if_dirty(self, chat_id: ChatId) -> bool:
+        lock = self._locks.setdefault(str(chat_id.value), asyncio.Lock())
+
+        async with lock:
+            room = await self._registry.get(chat_id)
+            if room is None or not room.is_dirty:
+                return False
+
+            pending_messages = await room.pending_messages()
+            if not pending_messages:
+                room.mark_clean()
+                return False
+
+            messages = [
+                self._message_service.create_user_message(
+                    content=item.content,
+                    chat_id=item.chat_id,
+                    author_id=item.author_id,
+                    now=item.created_at,
+                    reply_to_message_id=item.reply_to_message_id,
+                    runtime_id=item.runtime_id,
+                )
+                for item in pending_messages
+                if item.author_id is not None and item.runtime_id is not None
+            ]
+            await self._message_commands.add_many(messages)
+            await room.mark_persisted(
+                [message.runtime_id for message in messages if message.runtime_id is not None]
+            )
+            room.mark_clean()
+            return True
+
+src/application/usecases/__init__.py
+
+from .actor import CreateActorRequest, CreateActorResponse, CreateActorUsecase
+from .chat import AddChatMemberRequest, AddChatMemberResponse, AddChatMemberUsecase
+from .chat import CreateChatRequest, CreateChatResponse, CreateChatUsecase
+from .chat import JoinChatRoomRequest, JoinChatRoomResponse, JoinChatRoomUsecase
+from .chat import (
+    RemoveChatMemberRequest,
+    RemoveChatMemberResponse,
+    RemoveChatMemberUsecase,
+)
+from .chat import RequireChatAccessRequest, RequireChatAccessResponse, RequireChatAccessUsecase
+from .chat import ServeChatConnectionRequest, ServeChatConnectionUsecase
+from .message import (
+    CreateSystemMessageRequest,
+    CreateSystemMessageResponse,
+    CreateSystemMessageUsecase,
+)
+from .message import (
+    CreateUserMessageRequest,
+    CreateUserMessageResponse,
+    CreateUserMessageUsecase,
+)
+from .message import GetChatHistoryRequest, GetChatHistoryResponse, GetChatHistoryUsecase
+
+src/application/usecases/actor/__init__.py
+
+from .create_actor import CreateActorRequest, CreateActorResponse, CreateActorUsecase
+
+src/application/usecases/actor/create_actor.py
+
+from dataclasses import dataclass
+from uuid import UUID
+
+from application.ports.gateways import ActorCommandGateway, ActorQueryGateway
+from domain.entities.actor import Actor, ActorId
+from domain.services import ActorService
+
+
+@dataclass(frozen=True)
+class CreateActorRequest:
+    actor_id: ActorId
+    display_name: str
+    public_id: str
+
+    @classmethod
+    def from_primitives(
+        cls, actor_id: str, display_name: str, *, email: str
+    ) -> "CreateActorRequest":
+        return cls(
+            actor_id=ActorId(UUID(actor_id)),
+            display_name=display_name,
+            public_id=email,
+        )
+
+
+@dataclass(frozen=True)
+class CreateActorResponse:
+    actor_id: ActorId
+    was_created: bool
+
+    @classmethod
+    def from_entity(cls, actor: Actor, was_created: bool) -> "CreateActorResponse":
+        return cls(actor_id=actor.id, was_created=was_created)
+
+
+class CreateActorUsecase:
+    def __init__(
+        self,
+        actor_queries: ActorQueryGateway,
+        actor_commands: ActorCommandGateway,
+        actor_service: ActorService,
+    ) -> None:
+        self._actor_queries = actor_queries
+        self._actor_commands = actor_commands
+        self._actor_service = actor_service
+
+    async def __call__(self, request: CreateActorRequest) -> CreateActorResponse:
+        existing_actor = await self._actor_queries.by_id(request.actor_id)
+        if existing_actor is not None:
+            return CreateActorResponse.from_entity(existing_actor, was_created=False)
+
+        new_actor = self._actor_service.create_actor(
+            actor_id=request.actor_id,
+            display_name=request.display_name,
+            public_id=request.public_id,
+        )
+        await self._actor_commands.add(new_actor)
+        return CreateActorResponse.from_entity(new_actor, was_created=True)
+
+src/application/usecases/chat/__init__.py
+
+from .add_chat_member import (
+    AddChatMemberRequest,
+    AddChatMemberResponse,
+    AddChatMemberUsecase,
+)
+from .remove_chat_member import (
+    RemoveChatMemberRequest,
+    RemoveChatMemberResponse,
+    RemoveChatMemberUsecase,
+)
+from .create_chat import CreateChatRequest, CreateChatResponse, CreateChatUsecase
+from .join_chat_room import JoinChatRoomRequest, JoinChatRoomResponse, JoinChatRoomUsecase
+from .require_chat_access import (
+    RequireChatAccessRequest,
+    RequireChatAccessResponse,
+    RequireChatAccessUsecase,
+)
+from .serve_chat_connection import ServeChatConnectionRequest, ServeChatConnectionUsecase
+
+src/application/usecases/chat/add_chat_member.py
+
+from dataclasses import dataclass
+from datetime import datetime
+from uuid import UUID
+
+from application.exceptions import ActorNotFoundError
+from application.ports import Clock
+from application.ports.gateways import (
+    ActorQueryGateway,
+    ChatMembershipCommandGateway,
+    ChatMembershipQueryGateway,
+)
+from domain.entities.actor import Actor, ActorId
+from domain.entities.chat import ChatId, ChatMembership
+from domain.services import ChatService
+
+
+@dataclass(frozen=True)
+class AddChatMemberRequest:
+    chat_id: ChatId
+    actor_id: ActorId
+
+    @classmethod
+    def from_primitives(cls, chat_id: UUID, actor_id: str) -> "AddChatMemberRequest":
+        return cls(chat_id=ChatId(chat_id), actor_id=ActorId(UUID(actor_id)))
+
+
+@dataclass(frozen=True)
+class AddChatMemberResponse:
+    chat_id: ChatId
+    actor_id: ActorId
+    joined_at: datetime
+    display_name: str
+    public_id: str
+    was_added: bool
+
+    @classmethod
+    def from_entity(
+        cls, membership: ChatMembership, actor: Actor, was_added: bool
+    ) -> "AddChatMemberResponse":
+        return cls(
+            chat_id=membership.chat,
+            actor_id=membership.actor,
+            joined_at=membership.joined_at,
+            display_name=actor.display_name.value,
+            public_id=actor.public_id,
+            was_added=was_added,
+        )
+
+
+class AddChatMemberUsecase:
+    def __init__(
+        self,
+        clock: Clock,
+        actor_queries: ActorQueryGateway,
+        membership_queries: ChatMembershipQueryGateway,
+        membership_commands: ChatMembershipCommandGateway,
+        chat_service: ChatService,
+    ) -> None:
+        self._clock = clock
+        self._actor_queries = actor_queries
+        self._membership_queries = membership_queries
+        self._membership_commands = membership_commands
+        self._chat_service = chat_service
+
+    async def __call__(self, request: AddChatMemberRequest) -> AddChatMemberResponse:
+        actor = await self._actor_queries.by_id(request.actor_id)
+        if actor is None:
+            raise ActorNotFoundError(f"Actor {request.actor_id.value} was not found")
+
+        existing_membership = await self._membership_queries.by_chat_and_actor(
+            request.chat_id,
+            request.actor_id,
+        )
+        if existing_membership is not None:
+            return AddChatMemberResponse.from_entity(
+                existing_membership, actor=actor, was_added=False
+            )
+
+        membership = self._chat_service.create_membership(
+            chat_id=request.chat_id,
+            actor_id=request.actor_id,
+            now=self._clock.now(),
+        )
+        await self._membership_commands.add(membership)
+        return AddChatMemberResponse.from_entity(membership, actor=actor, was_added=True)
+
+src/application/usecases/chat/create_chat.py
+
+from dataclasses import dataclass
+from datetime import datetime
+
+from application.ports import Clock
+from application.ports.gateways import ChatCommandGateway, ChatQueryGateway
+from domain.entities.chat import Chat, ChatId, ContextKind, ContextRef
+from domain.services.chat import ChatService
+
+
+@dataclass(frozen=True)
+class CreateChatRequest:
+    name: str | None
+    context: ContextRef
+
+    @classmethod
+    def from_primitives(
+        cls, name: str | None, context_kind: ContextKind, ref: str
+    ) -> "CreateChatRequest":
+        return cls(name=name, context=ContextRef(kind=context_kind, external_id=ref))
+
+
+@dataclass(frozen=True)
+class CreateChatResponse:
+    chat_id: ChatId
+    created_at: datetime
+    was_created: bool
+
+    @classmethod
+    def from_entity(cls, chat: Chat, was_created: bool) -> "CreateChatResponse":
+        return cls(
+            chat_id=chat.id,
+            created_at=chat.created_at,
+            was_created=was_created,
+        )
+
+
+class CreateChatUsecase:
+    def __init__(
+        self,
+        clock: Clock,
+        chat_queries: ChatQueryGateway,
+        chat_commands: ChatCommandGateway,
+        chat_service: ChatService,
+    ) -> None:
+        self._clock = clock
+        self._chat_queries = chat_queries
+        self._chat_service = chat_service
+        self._chat_commands = chat_commands
+
+    async def __call__(self, request: CreateChatRequest) -> CreateChatResponse:
+        existing_chat = await self._chat_queries.by_context(request.context)
+        if existing_chat is not None:
+            return CreateChatResponse.from_entity(existing_chat, was_created=False)
+
+        now = self._clock.now()
+        new_chat = self._chat_service.create_chat(
+            name=request.name,
+            context=request.context,
+            now=now,
+        )
+        await self._chat_commands.add(new_chat)
+        return CreateChatResponse.from_entity(new_chat, was_created=True)
+
+src/application/usecases/chat/join_chat_room.py
+
+from dataclasses import dataclass
+
+from application.ports import ChatMessage, ChatRoom, ChatRoomFactory, ChatRoomRegistry
+from application.exceptions import ChatNotFoundError
+from application.ports.gateways import ChatQueryGateway
+from application.usecases.chat.require_chat_access import (
+    RequireChatAccessRequest,
+    RequireChatAccessUsecase,
+)
+from application.usecases.message.get_chat_history import (
+    GetChatHistoryRequest,
+    GetChatHistoryUsecase,
+)
+from domain.entities.actor import Actor, ActorId
+from domain.entities.chat import ChatId, ContextRef
+
+
+@dataclass(frozen=True)
+class JoinChatRoomRequest:
+    context: ContextRef
+    actor_id: ActorId
+    history_limit: int
+
+
+@dataclass(frozen=True)
+class JoinChatRoomResponse:
+    actor: Actor
+    room: ChatRoom
+    history: list[ChatMessage]
+
+
+class JoinChatRoomUsecase:
+    def __init__(
+        self,
+        chat_queries: ChatQueryGateway,
+        access_usecase: RequireChatAccessUsecase,
+        history_usecase: GetChatHistoryUsecase,
+        room_registry: ChatRoomRegistry,
+        room_factory: ChatRoomFactory,
+    ) -> None:
+        self._chat_queries = chat_queries
+        self._access_usecase = access_usecase
+        self._history_usecase = history_usecase
+        self._room_registry = room_registry
+        self._room_factory = room_factory
+
+    async def __call__(self, request: JoinChatRoomRequest) -> JoinChatRoomResponse:
+        chat = await self._chat_queries.by_context(request.context)
+        if chat is None:
+            raise ChatNotFoundError(
+                f"Chat for {request.context.kind.value}:{request.context.external_id} was not found"
+            )
+
+        access = await self._access_usecase(
+            RequireChatAccessRequest(
+                chat_id=chat.id,
+                actor_id=request.actor_id,
+            )
+        )
+
+        active_room = await self._room_registry.get(chat.id)
+        if active_room is None:
+            active_room = await self._room_registry.register(
+                chat.id,
+                self._room_factory.create(chat.id),
+            )
+
+        history = await self._history_usecase(
+            GetChatHistoryRequest(
+                chat_id=chat.id,
+                limit=request.history_limit,
+            )
+        )
+        return JoinChatRoomResponse(
+            actor=access.actor,
+            room=active_room,
+            history=history.messages,
+        )
+
+src/application/usecases/chat/remove_chat_member.py
+
+from dataclasses import dataclass
+from uuid import UUID
+
+from application.exceptions import ActorNotFoundError
+from application.ports.gateways import (
+    ActorQueryGateway,
+    ChatMembershipCommandGateway,
+    ChatMembershipQueryGateway,
+)
+from domain.entities.actor import Actor, ActorId
+from domain.entities.chat import ChatId
+
+
+@dataclass(frozen=True)
+class RemoveChatMemberRequest:
+    chat_id: ChatId
+    actor_id: ActorId
+
+    @classmethod
+    def from_primitives(cls, chat_id: UUID, actor_id: str) -> "RemoveChatMemberRequest":
+        return cls(chat_id=ChatId(chat_id), actor_id=ActorId(UUID(actor_id)))
+
+
+@dataclass(frozen=True)
+class RemoveChatMemberResponse:
+    chat_id: ChatId
+    actor_id: ActorId
+    display_name: str
+    public_id: str
+    name: str
+    was_removed: bool
+
+    @classmethod
+    def from_actor(
+        cls, chat_id: ChatId, actor: Actor, was_removed: bool
+    ) -> "RemoveChatMemberResponse":
+        return cls(
+            chat_id=chat_id,
+            actor_id=actor.id,
+            display_name=actor.display_name.value,
+            public_id=actor.public_id,
+            name=actor.display_name.value,
+            was_removed=was_removed,
+        )
+
+
+class RemoveChatMemberUsecase:
+    def __init__(
+        self,
+        actor_queries: ActorQueryGateway,
+        membership_queries: ChatMembershipQueryGateway,
+        membership_commands: ChatMembershipCommandGateway,
+    ) -> None:
+        self._actor_queries = actor_queries
+        self._membership_queries = membership_queries
+        self._membership_commands = membership_commands
+
+    async def __call__(
+        self, request: RemoveChatMemberRequest
+    ) -> RemoveChatMemberResponse:
+        actor = await self._actor_queries.by_id(request.actor_id)
+        if actor is None:
+            raise ActorNotFoundError(f"Actor {request.actor_id.value} was not found")
+
+        existing_membership = await self._membership_queries.by_chat_and_actor(
+            request.chat_id,
+            request.actor_id,
+        )
+        if existing_membership is None:
+            return RemoveChatMemberResponse.from_actor(
+                request.chat_id, actor, was_removed=False
+            )
+
+        await self._membership_commands.remove(request.chat_id, request.actor_id)
+        return RemoveChatMemberResponse.from_actor(request.chat_id, actor, was_removed=True)
+
+src/application/usecases/chat/require_chat_access.py
+
+from dataclasses import dataclass
+
+from application.exceptions import (
+    ActorNotFoundError,
+    ChatMembershipForbiddenError,
+    ChatNotFoundError,
+)
+from application.ports.gateways import (
+    ActorQueryGateway,
+    ChatMembershipQueryGateway,
+    ChatQueryGateway,
+)
+from domain.entities.actor import Actor, ActorId
+from domain.entities.chat import ChatId
+
+
+@dataclass(frozen=True)
+class RequireChatAccessRequest:
+    chat_id: ChatId
+    actor_id: ActorId
+
+
+@dataclass(frozen=True)
+class RequireChatAccessResponse:
+    actor: Actor
+
+
+class RequireChatAccessUsecase:
+    def __init__(
+        self,
+        actor_queries: ActorQueryGateway,
+        chat_queries: ChatQueryGateway,
+        membership_queries: ChatMembershipQueryGateway,
+    ) -> None:
+        self._actor_queries = actor_queries
+        self._chat_queries = chat_queries
+        self._membership_queries = membership_queries
+
+    async def __call__(
+        self, request: RequireChatAccessRequest
+    ) -> RequireChatAccessResponse:
+        actor = await self._actor_queries.by_id(request.actor_id)
+        if actor is None:
+            raise ActorNotFoundError(f"Actor {request.actor_id.value} was not found")
+
+        chat = await self._chat_queries.by_id(request.chat_id)
+        if chat is None:
+            raise ChatNotFoundError(f"Chat {request.chat_id.value} was not found")
+
+        membership = await self._membership_queries.by_chat_and_actor(
+            request.chat_id,
+            request.actor_id,
+        )
+        if membership is None:
+            raise ChatMembershipForbiddenError(
+                f"Actor {request.actor_id.value} is not a member of chat {request.chat_id.value}"
+            )
+
+        return RequireChatAccessResponse(actor=actor)
+
+src/application/usecases/chat/serve_chat_connection.py
+
+from dataclasses import dataclass
+
+from application.ports import ChatConnection, ChatRoom, ChatRoomEventPublisher
+from domain.entities.actor import Actor
+
+
+@dataclass(frozen=True)
+class ServeChatConnectionRequest:
+    room: ChatRoom
+    actor: Actor
+    connection: ChatConnection
+
+
+class ServeChatConnectionUsecase:
+    def __init__(self, events: ChatRoomEventPublisher) -> None:
+        self._events = events
+
+    async def __call__(self, request: ServeChatConnectionRequest) -> None:
+        await self._events.publish_client_joined(
+            request.room.chat_id,
+            request.actor,
+        )
+        try:
+            await request.room.serve(request.actor, request.connection)
+        finally:
+            await self._events.publish_client_left(
+                request.room.chat_id,
+                request.actor,
+            )
+
+src/application/usecases/message/__init__.py
+
+from .create_user_message import (
+    CreateUserMessageRequest,
+    CreateUserMessageResponse,
+    CreateUserMessageUsecase,
+)
+from .get_chat_history import GetChatHistoryRequest, GetChatHistoryResponse, GetChatHistoryUsecase
+from .create_system_message import (
+    CreateSystemMessageRequest,
+    CreateSystemMessageResponse,
+    CreateSystemMessageUsecase,
+)
+
+src/application/usecases/message/create_system_message.py
+
+from dataclasses import dataclass
+from datetime import datetime
+
+from application.ports import Clock
+from application.ports.gateways import MessageCommandGateway
+from domain.entities.chat import ChatId
+from domain.entities.message import MessageId, SystemMessage
+from domain.services.message import MessageService
+
+
+@dataclass(frozen=True)
+class CreateSystemMessageRequest:
+    chat_id: ChatId
+    content: str
+
+
+@dataclass(frozen=True)
+class CreateSystemMessageResponse:
+    message_id: MessageId
+    created_at: datetime
+
+    @classmethod
+    def from_entity(
+        cls, message: SystemMessage
+    ) -> "CreateSystemMessageResponse":
+        return cls(message_id=message.id, created_at=message.created_at)
+
+
+class CreateSystemMessageUsecase:
+    def __init__(
+        self,
+        clock: Clock,
+        message_commands: MessageCommandGateway,
+        message_service: MessageService,
+    ) -> None:
+        self._clock = clock
+        self._message_commands = message_commands
+        self._message_service = message_service
+
+    async def __call__(
+        self, request: CreateSystemMessageRequest
+    ) -> CreateSystemMessageResponse:
+        message = self._message_service.create_system_message(
+            content=request.content,
+            chat_id=request.chat_id,
+            now=self._clock.now(),
+        )
+        await self._message_commands.add(message)
+        return CreateSystemMessageResponse.from_entity(message)
+
+src/application/usecases/message/create_user_message.py
+
+from dataclasses import dataclass
+from datetime import datetime
+
+from application.ports import Clock
+from application.ports.gateways import MessageCommandGateway
+from domain.entities.actor import ActorId
+from domain.entities.chat import ChatId
+from domain.entities.message import MessageId, UserMessage
+from domain.services.message import MessageService
+
+
+@dataclass(frozen=True)
+class CreateUserMessageRequest:
+    chat_id: ChatId
+    actor_id: ActorId
+    content: str
+    created_at: datetime | None = None
+    reply_to_message_id: MessageId | None = None
+    runtime_id: str | None = None
+
+
+@dataclass(frozen=True)
+class CreateUserMessageResponse:
+    message_id: MessageId
+    created_at: datetime
+    runtime_id: str | None
+
+    @classmethod
+    def from_entity(cls, message: UserMessage) -> "CreateUserMessageResponse":
+        return cls(
+            message_id=message.id,
+            created_at=message.created_at,
+            runtime_id=message.runtime_id,
+        )
+
+
+class CreateUserMessageUsecase:
+    def __init__(
+        self,
+        clock: Clock,
+        message_commands: MessageCommandGateway,
+        message_service: MessageService,
+    ) -> None:
+        self._clock = clock
+        self._message_commands = message_commands
+        self._message_service = message_service
+
+    async def __call__(
+        self, request: CreateUserMessageRequest
+    ) -> CreateUserMessageResponse:
+        message = self._message_service.create_user_message(
+            content=request.content,
+            chat_id=request.chat_id,
+            author_id=request.actor_id,
+            now=request.created_at or self._clock.now(),
+            reply_to_message_id=request.reply_to_message_id,
+            runtime_id=request.runtime_id,
+        )
+        await self._message_commands.add(message)
+        return CreateUserMessageResponse.from_entity(message)
+
+src/application/usecases/message/get_chat_history.py
+
+from dataclasses import dataclass
+from datetime import datetime
+
+from application.ports import ChatMessage, ChatRuntimeStore
+from application.ports.gateways import MessageQueryGateway
+from domain.entities.chat import ChatId
+
+
+@dataclass(frozen=True)
+class GetChatHistoryRequest:
+    chat_id: ChatId
+    limit: int
+    before_created_at: datetime | None = None
+    before_message_id: int | None = None
+
+
+@dataclass(frozen=True)
+class GetChatHistoryResponse:
+    messages: list[ChatMessage]
+    has_more: bool
+    next_before_created_at: datetime | None
+    next_before_message_id: int | None
+
+
+class GetChatHistoryUsecase:
+    def __init__(
+        self,
+        message_queries: MessageQueryGateway,
+        runtime_store: ChatRuntimeStore,
+    ) -> None:
+        self._message_queries = message_queries
+        self._runtime_store = runtime_store
+
+    async def __call__(
+        self, request: GetChatHistoryRequest
+    ) -> GetChatHistoryResponse:
+        limit = max(request.limit, 1)
+        persisted_messages = await self._message_queries.recent_by_chat(
+            request.chat_id,
+            limit + 1,
+            before_created_at=request.before_created_at,
+            before_message_id=request.before_message_id,
+        )
+
+        has_more = len(persisted_messages) > limit
+        if has_more:
+            persisted_messages = persisted_messages[1:]
+
+        history = list(persisted_messages)
+        if request.before_created_at is None:
+            pending_messages = await self._runtime_store.list_pending_messages(request.chat_id)
+            history.extend(pending_messages)
+
+        history.sort(
+            key=lambda message: (
+                message.created_at,
+                message.message_id.value if message.message_id is not None else 0,
+                message.runtime_id or "",
+            )
+        )
+        page = history[-limit:]
+
+        next_before_created_at: datetime | None = None
+        next_before_message_id: int | None = None
+        if has_more:
+            first_persisted = next(
+                (message for message in page if message.message_id is not None),
+                None,
+            )
+            if first_persisted is not None and first_persisted.message_id is not None:
+                next_before_created_at = first_persisted.created_at
+                next_before_message_id = first_persisted.message_id.value
+            else:
+                has_more = False
+
+        return GetChatHistoryResponse(
+            messages=page,
+            has_more=has_more,
+            next_before_created_at=next_before_created_at,
+            next_before_message_id=next_before_message_id,
+        )
+
+src/domain/entities/__init__.py
+
+from .base import Entity
+from .chat import Chat
+
+src/domain/entities/actor/__init__.py
+
+from .ids import ActorId
+from .entity import Actor
+
+src/domain/entities/actor/entity.py
+
+from dataclasses import dataclass
+from domain.value_objects import Name
+from ..base import Entity
+from .ids import ActorId
+
+
+@dataclass
+class Actor(Entity[ActorId]):
+    display_name: Name
+    public_id: str
+
+src/domain/entities/actor/ids.py
+
+from dataclasses import dataclass
+from domain.value_objects import Id
+from uuid import UUID
+
+
+@dataclass(frozen=True)
+class ActorId(Id[UUID]): ...
+
+src/domain/entities/base.py
+
+from dataclasses import dataclass
+from domain.value_objects import Id
+
+
+@dataclass(eq=False)
+class Entity[idT: Id]:
+    """Base class for entites
+
+    Attributues:
+        id: unqiue identifier that must be in every entity
+
+    Notes:
+        Class ensures that entities would be equal not by value but by id
+
+    """
+
+    id: idT
+
+    def __eq__(self, other: object) -> bool:
+
+        if not isinstance(other, Entity):
+            return NotImplemented
+        if type(self) is not type(other):
+            return NotImplemented
+        return self.id == other.id
+
+src/domain/entities/chat/__init__.py
+
+from .entity import Chat
+from .ids import ChatId
+from .context import ContextKind, ContextRef
+from .membership import ChatMembership
+
+src/domain/entities/chat/context.py
+
+from dataclasses import dataclass
+from enum import StrEnum
+
+
+class ContextKind(StrEnum):
+    PROJECT = "project"
+    DOCUMENT = "document"
+
+
+@dataclass(frozen=True)
+class ContextRef:
+    kind: ContextKind
+    external_id: str
+
+src/domain/entities/chat/entity.py
+
+from datetime import datetime
+
+from dataclasses import dataclass, field
+from ..base import Entity
+from .ids import ChatId
+from .context import ContextRef
+from .membership import ChatMembership
+
+
+@dataclass
+class Chat(Entity[ChatId]):
+    context: ContextRef
+    created_at: datetime
+    updated_at: datetime
+    name: str | None = None
+    members: list[ChatMembership] = field(default_factory=list)
+
+src/domain/entities/chat/ids.py
+
+from dataclasses import dataclass
+from domain.value_objects import Id
+from uuid import UUID
+
+
+@dataclass(frozen=True)
+class ChatId(Id[UUID]): ...
+
+src/domain/entities/chat/membership.py
+
+from dataclasses import dataclass
+from datetime import datetime
+
+from .ids import ChatId
+from ..actor import ActorId
+
+
+@dataclass(frozen=True)
+class ChatMembership:
+    chat: ChatId
+    actor: ActorId
+    joined_at: datetime
+
+src/domain/entities/message/__init__.py
+
+from .entity import Message, SystemMessage, UserMessage
+from .enums import MessageAuthorKind
+from .ids import MessageId
+
+src/domain/entities/message/entity.py
+
+from dataclasses import dataclass
+from datetime import datetime
+
+from ..base import Entity
+from ..actor import ActorId
+from ..chat import ChatId
+from .ids import MessageId
+from .enums import MessageAuthorKind
+
+
+@dataclass
+class Message(Entity[MessageId]):
+    chat_id: ChatId
+    content: bytes
+    created_at: datetime
+    author_kind: MessageAuthorKind
+    author_id: ActorId | None = None
+    reply_to_message_id: MessageId | None = None
+    runtime_id: str | None = None
+
+
+@dataclass
+class SystemMessage(Message):
+    author_kind: MessageAuthorKind = MessageAuthorKind.SYSTEM
+
+
+@dataclass
+class UserMessage(Message):
+    author_kind: MessageAuthorKind = MessageAuthorKind.USER
+
+src/domain/entities/message/enums.py
+
+from enum import StrEnum
+
+
+class MessageAuthorKind(StrEnum):
+    USER = "user"
+    BOT = "bot"
+    SYSTEM = "system"
+
+src/domain/entities/message/ids.py
+
+from dataclasses import dataclass
+from domain.value_objects import Id
+
+
+@dataclass(frozen=True)
+class MessageId(Id[int | None]): ...
+
+src/domain/exceptions/__init__.py
+
+from .base import DomainError, DomainFieldError
+
+src/domain/exceptions/base.py
+
+class DomainError(Exception): ...
+
+
+class DomainFieldError(DomainError): ...
+
+src/domain/ports/__init__.py
+
+from .id_generator import IdGenerator
+from .message_content_encrypter import MessageContentEncrypter
+
+src/domain/ports/id_generator.py
+
+from typing import Protocol
+from domain.value_objects import Id
+
+
+class IdGenerator[idT: Id](Protocol):
+    def __call__(self) -> idT:
+        raise NotImplementedError
+
+src/domain/ports/message_content_encrypter.py
+
+from typing import Protocol
+
+
+class MessageContentEncrypter(Protocol):
+    def __call__(self, content: str) -> bytes:
+        raise NotImplementedError
+
+    def decrypt(self, content: bytes) -> str:
+        raise NotImplementedError
+
+src/domain/services/__init__.py
+
+from .actor import ActorService
+from .chat import ChatService
+from .message import MessageService
+
+src/domain/services/actor.py
+
+from domain.entities.actor import Actor, ActorId
+from domain.value_objects import Name
+
+
+class ActorService:
+    def create_actor(
+        self, actor_id: ActorId, display_name: str, public_id: str
+    ) -> Actor:
+        return Actor(
+            id=actor_id,
+            display_name=Name(display_name),
+            public_id=public_id,
+        )
+
+src/domain/services/chat.py
+
+from datetime import datetime
+
+from domain.ports import IdGenerator
+from domain.entities.actor import ActorId
+from domain.entities.chat import ChatId, Chat, ChatMembership, ContextRef
+
+
+class ChatIdGenerator(IdGenerator[ChatId]): ...
+
+
+class ChatService:
+    def __init__(self, id_generator: ChatIdGenerator):
+        self._id_generator = id_generator
+
+    def create_chat(self, name: str | None, context: ContextRef, now: datetime) -> Chat:
+        return Chat(
+            id=self._id_generator(),
+            name=name,
+            context=context,
+            created_at=now,
+            updated_at=now,
+            members=[],
+        )
+
+    def create_membership(
+        self, chat_id: ChatId, actor_id: ActorId, now: datetime
+    ) -> ChatMembership:
+        return ChatMembership(chat=chat_id, actor=actor_id, joined_at=now)
+
+src/domain/services/message.py
+
+from datetime import datetime
+
+from domain.ports import MessageContentEncrypter
+from domain.entities.actor import ActorId
+from domain.entities.chat import ChatId
+from domain.entities.message import MessageId, SystemMessage, UserMessage
+
+
+class MessageService:
+    def __init__(self, encrypter: MessageContentEncrypter):
+        self._encrypter = encrypter
+
+    def create_system_message(
+        self, content: str, chat_id: ChatId, now: datetime
+    ) -> SystemMessage:
+        return SystemMessage(
+            id=MessageId(None),
+            chat_id=chat_id,
+            content=self._encrypter(content),
+            created_at=now,
+        )
+
+    def create_user_message(
+        self,
+        *,
+        content: str,
+        chat_id: ChatId,
+        author_id: ActorId,
+        now: datetime,
+        reply_to_message_id: MessageId | None = None,
+        runtime_id: str | None = None,
+    ) -> UserMessage:
+        return UserMessage(
+            id=MessageId(None),
+            chat_id=chat_id,
+            content=self._encrypter(content),
+            created_at=now,
+            author_id=author_id,
+            reply_to_message_id=reply_to_message_id,
+            runtime_id=runtime_id,
+        )
+
+src/domain/value_objects/__init__.py
+
+from .id import Id
+from .message_encryption_key import MessageEncryptionKey
+from .name import Name
+
+src/domain/value_objects/id.py
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True, eq=False)
+class Id[T]:
+    """Base value object for strongly-typed identifiers.
+
+    This class represents an immutable identifier that compares
+    by value rather than by object identity.
+
+    It is intended to be subclassed for specific domain entities
+    (e.g., UserId, ProjectId) to provide type safety.
+
+    Attributes:
+        value: Underlying identifier value.
+
+    Notes:
+        Instances are immutable and hashable, allowing their use
+        as dictionary keys and set elements.
+    """
+
+    value: T
+
+    def __eq__(self, other: object) -> bool:
+
+        if not isinstance(other, Id):
+            return NotImplemented
+        if type(self) is not type(other):
+            return NotImplemented
+        return self.value == other.value
+
+    def __hash__(self) -> int:
+        return hash(self.value)
+
+src/domain/value_objects/message_encryption_key.py
+
+from dataclasses import dataclass
+
+from domain.exceptions import DomainFieldError
+
+
+@dataclass(frozen=True)
+class MessageEncryptionKey:
+    value: str
+
+    def __post_init__(self) -> None:
+        if not self.value:
+            raise DomainFieldError("Message encryption key cannot be empty")
+
+src/domain/value_objects/name.py
+
+from dataclasses import dataclass
+from ..exceptions import DomainFieldError
+
+
+@dataclass(frozen=True, init=False)
+class Name:
+    __max_name_length: int = 100
+    value: str
+
+    def __init__(self, raw_name: str):
+        cleaned_value = self._clean_value(raw_name)
+
+        if len(cleaned_value) > self.__max_name_length:
+            raise DomainFieldError(
+                f"Name is too long. Maximum {self.__max_name_length} characters allowed"
+            )
+
+        if not cleaned_value or cleaned_value.strip() == "":
+            raise DomainFieldError("Name cannot be empty")
+
+        if not self._is_valid_name(cleaned_value):
+            raise DomainFieldError(
+                "Name contains invalid characters. Only letters, spaces, dots and hyphens are allowed"
+            )
+
+        object.__setattr__(self, "value", cleaned_value)
+
+    def _clean_value(self, value: str) -> str:
+        if not isinstance(value, str):
+            raise DomainFieldError("Name must be a string")
+
+        cleaned = value.strip()
+
+        while "  " in cleaned:
+            cleaned = cleaned.replace("  ", " ")
+
+        return cleaned
+
+    def _is_valid_name(self, value: str) -> bool:
+        if not value:
+            return False
+
+        for character in value:
+            if not (character.isalpha() or character in {".", "-", " ", "_"}):
+                return False
+        return True
+
+src/infrastructure/adapters/__init__.py
+
+from .clock import TimestampClock
+from .id_generator import Uuid7ChatIdGenerator
+from .message_content_encrypter import FernetMessageContentEncrypter
+from .transaction import SQLAlchemyTransaction
+from .unit_of_work import UnitOfWorkImpl
+
+src/infrastructure/adapters/clock.py
+
+from datetime import UTC, datetime
+
+
+class TimestampClock:
+    def now(self) -> datetime:
+        return datetime.now(tz=UTC)
+
+src/infrastructure/adapters/gateways/__init__.py
+
+from .actor import (
+    SQLAlchemyActorCommandGateway,
+    SQLAlchemyActorQueryGateway,
+    SQLAlchemyChatMembershipCommandGateway,
+    SQLAlchemyChatMembershipQueryGateway,
+)
+from .chat import SQLAlchemyChatCommandGateway, SQLAlchemyChatQueryGateway
+from .message import (
+    SQLAlchemyDurableMessageCommandGateway,
+    SQLAlchemyMessageCommandGateway,
+)
+
+src/infrastructure/adapters/gateways/actor.py
+
+from sqlalchemy import delete, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from application.ports.gateways import (
+    ActorCommandGateway,
+    ActorQueryGateway,
+    ChatMembershipCommandGateway,
+    ChatMembershipQueryGateway,
+)
+from domain.entities.actor import Actor, ActorId
+from domain.entities.chat import ChatId, ChatMembership
+from domain.value_objects import Name
+from infrastructure.exceptions import network_error_aware
+from infrastructure.models import Actor as ActorModel
+from infrastructure.models import ChatMembership as ChatMembershipModel
+
+
+class SQLAlchemyActorCommandGateway(ActorCommandGateway):
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    @network_error_aware("Cannot store actor")
+    async def add(self, actor: Actor) -> None:
+        self._session.add(
+            ActorModel(
+                id=actor.id.value,
+                display_name=actor.display_name.value,
+                public_id=actor.public_id,
+            )
+        )
+        await self._session.flush()
+
+
+class SQLAlchemyActorQueryGateway(ActorQueryGateway):
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    @network_error_aware("Cannot load actor")
+    async def by_id(self, actor_id: ActorId) -> Actor | None:
+        stmt = select(ActorModel).where(ActorModel.id == actor_id.value)
+        model = await self._session.scalar(stmt)
+        if model is None:
+            return None
+        return Actor(
+            id=ActorId(model.id),
+            display_name=Name(model.display_name),
+            public_id=model.public_id,
+        )
+
+
+class SQLAlchemyChatMembershipCommandGateway(ChatMembershipCommandGateway):
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    @network_error_aware("Cannot store chat membership")
+    async def add(self, membership: ChatMembership) -> None:
+        self._session.add(
+            ChatMembershipModel(
+                chat_id=membership.chat.value,
+                actor_id=membership.actor.value,
+                joined_at=membership.joined_at,
+            )
+        )
+        await self._session.flush()
+
+    @network_error_aware("Cannot delete chat membership")
+    async def remove(self, chat_id: ChatId, actor_id: ActorId) -> None:
+        stmt = delete(ChatMembershipModel).where(
+            ChatMembershipModel.chat_id == chat_id.value,
+            ChatMembershipModel.actor_id == actor_id.value,
+        )
+        await self._session.execute(stmt)
+        await self._session.flush()
+
+
+class SQLAlchemyChatMembershipQueryGateway(ChatMembershipQueryGateway):
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    @network_error_aware("Cannot load chat membership")
+    async def by_chat_and_actor(
+        self, chat_id: ChatId, actor_id: ActorId
+    ) -> ChatMembership | None:
+        stmt = select(ChatMembershipModel).where(
+            ChatMembershipModel.chat_id == chat_id.value,
+            ChatMembershipModel.actor_id == actor_id.value,
+        )
+        model = await self._session.scalar(stmt)
+        if model is None:
+            return None
+        return ChatMembership(
+            chat=ChatId(model.chat_id),
+            actor=ActorId(model.actor_id),
+            joined_at=model.joined_at,
+        )
+
+src/infrastructure/adapters/gateways/chat.py
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
+
+from application.ports.gateways import ChatCommandGateway, ChatQueryGateway
+from domain.entities.chat import Chat, ChatId, ContextRef
+from infrastructure.adapters.mappers.chat import ChatDTO, SQLAlchemyChatMapper
+from infrastructure.exceptions import network_error_aware
+from infrastructure.models import Chat as ChatModel
+
+
+class SQLAlchemyChatCommandGateway(ChatCommandGateway):
+    def __init__(self, session: AsyncSession, mapper: SQLAlchemyChatMapper) -> None:
+        self._mapper = mapper
+        self._session = session
+
+    @network_error_aware("Cannot store chat")
+    async def add(self, chat: Chat) -> None:
+        dto = self._mapper.to_dto(chat)
+        self._session.add(dto.chat_model)
+        for membership in dto.memberships:
+            self._session.add(membership)
+        await self._session.flush()
+
+
+class SQLAlchemyChatQueryGateway(ChatQueryGateway):
+    def __init__(self, session: AsyncSession, mapper: SQLAlchemyChatMapper) -> None:
+        self._mapper = mapper
+        self._session = session
+
+    @network_error_aware("Cannot load chat by context")
+    async def by_context(self, context: ContextRef) -> Chat | None:
+        stmt = (
+            select(ChatModel)
+            .where(
+                ChatModel.context_kind == context.kind.value,
+                ChatModel.context_external_id == context.external_id,
+            )
+            .options(selectinload(ChatModel.members))
+        )
+        model: ChatModel | None = (
+            await self._session.execute(stmt)
+        ).scalar_one_or_none()
+        if model is None:
+            return None
+        dto = ChatDTO(chat_model=model, memberships=list(model.members))
+        return self._mapper.to_domain(dto)
+
+    @network_error_aware("Cannot load chat by id")
+    async def by_id(self, chat_id: ChatId) -> Chat | None:
+        stmt = (
+            select(ChatModel)
+            .where(ChatModel.id == chat_id.value)
+            .options(selectinload(ChatModel.members))
+        )
+        model: ChatModel | None = (
+            await self._session.execute(stmt)
+        ).scalar_one_or_none()
+        if model is None:
+            return None
+        dto = ChatDTO(chat_model=model, memberships=list(model.members))
+        return self._mapper.to_domain(dto)
+
+src/infrastructure/adapters/gateways/message.py
+
+from datetime import datetime
+
+from sqlalchemy import and_, or_, select
+from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
+
+from application.ports import ChatMessage
+from application.ports.gateways import (
+    DurableMessageCommandGateway,
+    MessageCommandGateway,
+    MessageQueryGateway,
+)
+from domain.entities.chat import ChatId
+from domain.entities.message import Message, MessageId
+from domain.ports import MessageContentEncrypter
+from infrastructure.adapters.mappers import (
+    SQLAlchemyChatMessageMapper,
+    SQLAlchemyDomainMessageMapper,
+    SQLAlchemyMessageDTO,
+)
+from infrastructure.exceptions import network_error_aware
+from infrastructure.models import Message as MessageModel
+from setup.db_helper import DatabaseHelper
+
+
+def _dto_to_values(dto: SQLAlchemyMessageDTO) -> dict[str, object]:
+    return {
+        "runtime_id": dto.runtime_id,
+        "content": dto.content,
+        "chat_id": dto.chat_id,
+        "created_at": dto.created_at,
+        "author_id": dto.author_id,
+        "author_kind": dto.author_kind,
+        "reply_to_message_id": dto.reply_to_message_id,
+    }
+
+
+class SQLAlchemyMessageCommandGateway(MessageCommandGateway, MessageQueryGateway):
+    def __init__(
+        self,
+        session: AsyncSession,
+        content_cipher: MessageContentEncrypter,
+    ) -> None:
+        self._session = session
+        self._content_cipher = content_cipher
+        self._domain_mapper = SQLAlchemyDomainMessageMapper()
+        self._chat_message_mapper = SQLAlchemyChatMessageMapper(content_cipher.decrypt)
+
+    @network_error_aware("Cannot store chat message")
+    async def add(self, message: Message) -> None:
+        dto = self._domain_mapper.to_dto(message)
+        model = MessageModel(
+            runtime_id=dto.runtime_id,
+            content=dto.content,
+            chat_id=dto.chat_id,
+            created_at=dto.created_at,
+            author_id=dto.author_id,
+            author_kind=dto.author_kind,
+            reply_to_message_id=dto.reply_to_message_id,
+        )
+        self._session.add(model)
+        await self._session.flush()
+        message.id = MessageId(model.id)
+
+    @network_error_aware("Cannot store chat messages")
+    async def add_many(self, messages: list[Message]) -> None:
+        if not messages:
+            return
+
+        stmt = insert(MessageModel).values(
+            [_dto_to_values(self._domain_mapper.to_dto(message)) for message in messages]
+        )
+        await self._session.execute(
+            stmt.on_conflict_do_nothing(index_elements=["runtime_id"])
+        )
+        await self._session.flush()
+
+    @network_error_aware("Cannot load chat message history")
+    async def recent_by_chat(
+        self,
+        chat_id: ChatId,
+        limit: int,
+        before_created_at: datetime | None = None,
+        before_message_id: int | None = None,
+    ) -> list[ChatMessage]:
+        stmt = select(MessageModel).where(MessageModel.chat_id == chat_id.value)
+        if before_created_at is not None and before_message_id is not None:
+            stmt = stmt.where(
+                or_(
+                    MessageModel.created_at < before_created_at,
+                    and_(
+                        MessageModel.created_at == before_created_at,
+                        MessageModel.id < before_message_id,
+                    ),
+                )
+            )
+
+        stmt = (
+            stmt.order_by(MessageModel.created_at.desc(), MessageModel.id.desc())
+            .limit(limit)
+            .options(selectinload(MessageModel.author))
+        )
+        models = list((await self._session.scalars(stmt)).all())
+        models.reverse()
+        return [
+            self._chat_message_mapper.to_message(
+                SQLAlchemyMessageDTO(
+                    message_id=model.id,
+                    runtime_id=model.runtime_id,
+                    content=model.content,
+                    chat_id=model.chat_id,
+                    created_at=model.created_at,
+                    author_id=model.author_id,
+                    author_display_name=(
+                        model.author.display_name if model.author is not None else None
+                    ),
+                    author_kind=model.author_kind,
+                    reply_to_message_id=model.reply_to_message_id,
+                )
+            )
+            for model in models
+        ]
+
+
+class SQLAlchemyDurableMessageCommandGateway(DurableMessageCommandGateway):
+    def __init__(self, db_helper: DatabaseHelper) -> None:
+        self._db_helper = db_helper
+
+    @network_error_aware("Cannot persist pending chat messages")
+    async def add_many(self, messages: list[Message]) -> None:
+        if not messages:
+            return
+
+        async with self._db_helper.session_factory() as session:
+            stmt = insert(MessageModel).values(
+                [
+                    _dto_to_values(SQLAlchemyDomainMessageMapper().to_dto(message))
+                    for message in messages
+                ]
+            )
+            await session.execute(
+                stmt.on_conflict_do_nothing(index_elements=["runtime_id"])
+            )
+            await session.commit()
+
+src/infrastructure/adapters/id_generator.py
+
+from domain.entities.chat import ChatId
+from utils import uuid7
+
+
+class Uuid7ChatIdGenerator:
+    def __call__(self) -> ChatId:
+        return ChatId(uuid7())
+
+src/infrastructure/adapters/mappers/__init__.py
+
+from .chat import SQLAlchemyChatMapper
+from .message import (
+    SQLAlchemyChatMessageMapper,
+    SQLAlchemyDomainMessageMapper,
+    SQLAlchemyMessageDTO,
+)
+
+src/infrastructure/adapters/mappers/chat.py
+
+from dataclasses import dataclass
+from domain.entities.actor import ActorId
+from domain.entities.chat import Chat, ChatMembership, ContextKind, ContextRef, ChatId
+from application.ports.mappers import ChatMapper
+from infrastructure.models import (
+    Chat as ChatModel,
+    ChatMembership as ChatMembershipModel,
+)
+from utils import ensure_utc_datetime
+
+
+@dataclass
+class ChatDTO:
+    chat_model: ChatModel
+    memberships: list[ChatMembershipModel]
+
+
+class SQLAlchemyChatMapper(ChatMapper[ChatDTO]):
+    def to_dto(self, domain: Chat) -> ChatDTO:
+        return ChatDTO(
+            chat_model=ChatModel(
+                id=domain.id.value,
+                name=domain.name,
+                context_kind=domain.context.kind.value,
+                context_external_id=domain.context.external_id,
+                created_at=ensure_utc_datetime(domain.created_at),
+                updated_at=ensure_utc_datetime(domain.updated_at),
+            ),
+            memberships=[
+                ChatMembershipModel(
+                    chat_id=member.chat.value,
+                    actor_id=member.actor.value,
+                    joined_at=ensure_utc_datetime(member.joined_at),
+                )
+                for member in domain.members
+            ],
+        )
+
+    def to_domain(self, dto: ChatDTO) -> Chat:
+        return Chat(
+            id=ChatId(dto.chat_model.id),
+            name=dto.chat_model.name,
+            context=ContextRef(
+                kind=ContextKind(dto.chat_model.context_kind),
+                external_id=dto.chat_model.context_external_id,
+            ),
+            created_at=ensure_utc_datetime(dto.chat_model.created_at),
+            updated_at=ensure_utc_datetime(dto.chat_model.updated_at),
+            members=[
+                ChatMembership(
+                    chat=ChatId(member.chat_id),
+                    actor=ActorId(member.actor_id),
+                    joined_at=ensure_utc_datetime(member.joined_at),
+                )
+                for member in dto.memberships
+            ],
+        )
+
+src/infrastructure/adapters/mappers/message.py
+
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Callable
+from uuid import UUID
+
+from application.ports import ChatMessage
+from application.ports.mappers import ChatMessageMapper, DomainMessageMapper
+from domain.entities.actor import ActorId
+from domain.entities.chat import ChatId
+from domain.entities.message import Message, MessageAuthorKind, MessageId
+from utils import ensure_utc_datetime
+
+
+@dataclass(frozen=True)
+class SQLAlchemyMessageDTO:
+    content: bytes
+    chat_id: UUID
+    created_at: datetime
+    author_kind: MessageAuthorKind
+    runtime_id: str | None = None
+    message_id: int | None = None
+    author_id: UUID | None = None
+    author_display_name: str | None = None
+    reply_to_message_id: int | None = None
+
+
+class SQLAlchemyDomainMessageMapper(DomainMessageMapper[SQLAlchemyMessageDTO]):
+    def to_dto(self, domain: Message) -> SQLAlchemyMessageDTO:
+        return SQLAlchemyMessageDTO(
+            message_id=domain.id.value,
+            runtime_id=domain.runtime_id,
+            content=domain.content,
+            chat_id=domain.chat_id.value,
+            created_at=ensure_utc_datetime(domain.created_at),
+            author_id=domain.author_id.value if domain.author_id is not None else None,
+            author_kind=domain.author_kind,
+            reply_to_message_id=(
+                domain.reply_to_message_id.value
+                if domain.reply_to_message_id is not None
+                else None
+            ),
+        )
+
+    def to_domain(self, dto: SQLAlchemyMessageDTO) -> Message:
+        return Message(
+            id=MessageId(dto.message_id),
+            runtime_id=dto.runtime_id,
+            chat_id=ChatId(dto.chat_id),
+            content=dto.content,
+            created_at=ensure_utc_datetime(dto.created_at),
+            author_id=ActorId(dto.author_id) if dto.author_id is not None else None,
+            author_kind=dto.author_kind,
+            reply_to_message_id=(
+                MessageId(dto.reply_to_message_id)
+                if dto.reply_to_message_id is not None
+                else None
+            ),
+        )
+
+
+class SQLAlchemyChatMessageMapper(ChatMessageMapper[SQLAlchemyMessageDTO]):
+    def __init__(self, decrypt_content: Callable[[bytes], str]) -> None:
+        self._decrypt_content = decrypt_content
+
+    def to_dto(self, message: ChatMessage) -> SQLAlchemyMessageDTO:
+        raise NotImplementedError("Chat messages are not written through this mapper")
+
+    def to_message(self, dto: SQLAlchemyMessageDTO) -> ChatMessage:
+        return ChatMessage(
+            chat_id=ChatId(dto.chat_id),
+            content=self._decrypt_content(dto.content),
+            created_at=ensure_utc_datetime(dto.created_at),
+            author_kind=dto.author_kind,
+            runtime_id=dto.runtime_id,
+            message_id=MessageId(dto.message_id) if dto.message_id is not None else None,
+            author_id=ActorId(dto.author_id) if dto.author_id is not None else None,
+            author_display_name=dto.author_display_name,
+            reply_to_message_id=(
+                MessageId(dto.reply_to_message_id)
+                if dto.reply_to_message_id is not None
+                else None
+            ),
+            persisted=True,
+        )
+
+src/infrastructure/adapters/message_content_encrypter.py
+
+from cryptography.fernet import Fernet
+
+from domain.value_objects import MessageEncryptionKey
+
+
+class FernetMessageContentEncrypter:
+    def __init__(self, key: MessageEncryptionKey) -> None:
+        self._fernet = Fernet(key.value.encode("utf-8"))
+
+    def __call__(self, content: str) -> bytes:
+        return self._fernet.encrypt(content.encode("utf-8"))
+
+    def decrypt(self, content: bytes) -> str:
+        return self._fernet.decrypt(content).decode("utf-8")
+
+src/infrastructure/adapters/transaction.py
+
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from application.ports import Transaction
+
+
+class SQLAlchemyTransaction(Transaction):
+    def __init__(self, session: AsyncSession):
+        self._session = session
+
+    async def complete(self) -> None:
+        await self._session.commit()
+
+    async def cancel(self) -> None:
+        await self._session.rollback()
+
+src/infrastructure/adapters/unit_of_work.py
+
+from typing import Type
+
+from application.ports import Transaction, UnitOfWork
+
+
+class UnitOfWorkImpl(UnitOfWork):
+    def __init__(self) -> None:
+        self._transactions: list[Transaction] = []
+
+    def add(self, transaction: Transaction) -> None:
+        self._transactions.append(transaction)
+
+    async def _complete(self) -> None:
+        for transaction in self._transactions:
+            await transaction.complete()
+
+    async def _cancel(self) -> None:
+        for transaction in self._transactions:
+            await transaction.cancel()
+
+    async def __aenter__(self) -> "UnitOfWork":
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: Type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: BaseException | None,
+    ) -> None:
+        if exc_type is None:
+            try:
+                await self._complete()
+            except Exception:
+                await self._cancel()
+                raise
+        else:
+            await self._cancel()
+
+        self._transactions.clear()
+
+src/infrastructure/chat_session/__init__.py
+
+from .events import InMemoryChatRoomEventPublisher
+from .factory import LiveChatRoomFactory
+from .mappers import RedisChatMessageDTO, RedisChatMessageMapper
+from .registry import InMemoryChatRoomRegistry
+from .runtime_store import RedisChatRuntimeStore
+
+src/infrastructure/chat_session/events.py
+
+import logging
+
+from application.ports import (
+    ChatClientJoinedEvent,
+    ChatClientLeftEvent,
+    ChatRoomEvent,
+    ChatRoomEventListener,
+    ChatRoomEventPublisher,
+    ChatRoomModifiedEvent,
+)
+from domain.entities.actor import Actor
+from domain.entities.chat import ChatId
+
+logger = logging.getLogger(__name__)
+
+
+class InMemoryChatRoomEventPublisher(ChatRoomEventPublisher):
+    def __init__(self) -> None:
+        self._listeners: list[ChatRoomEventListener] = []
+
+    def subscribe(self, listener: ChatRoomEventListener) -> None:
+        self._listeners.append(listener)
+
+    async def publish_client_joined(self, chat_id: ChatId, actor: Actor) -> None:
+        await self._publish(ChatClientJoinedEvent(chat_id=chat_id, actor=actor))
+
+    async def publish_client_left(self, chat_id: ChatId, actor: Actor) -> None:
+        await self._publish(ChatClientLeftEvent(chat_id=chat_id, actor=actor))
+
+    async def publish_room_modified(self, chat_id: ChatId) -> None:
+        await self._publish(ChatRoomModifiedEvent(chat_id=chat_id))
+
+    async def _publish(self, event: ChatRoomEvent) -> None:
+        for listener in self._listeners:
+            try:
+                await event.accept(listener)
+            except Exception:
+                logger.exception(
+                    "Listener %s failed for %s",
+                    type(listener).__name__,
+                    type(event).__name__,
+                )
+
+src/infrastructure/chat_session/factory.py
+
+from application.ports import (
+    ChatRoom,
+    ChatRoomEventPublisher,
+    ChatRoomFactory,
+    ChatRuntimeStore,
+    Clock,
+)
+from domain.entities.chat import ChatId
+
+from .room import LiveChatRoom
+
+
+class LiveChatRoomFactory(ChatRoomFactory):
+    def __init__(
+        self,
+        runtime_store: ChatRuntimeStore,
+        clock: Clock,
+        event_publisher: ChatRoomEventPublisher,
+    ) -> None:
+        self._runtime_store = runtime_store
+        self._clock = clock
+        self._event_publisher = event_publisher
+
+    def create(self, chat_id: ChatId) -> ChatRoom:
+        return LiveChatRoom(
+            chat_id=chat_id,
+            runtime_store=self._runtime_store,
+            clock=self._clock,
+            event_publisher=self._event_publisher,
+        )
+
+src/infrastructure/chat_session/mappers.py
+
+from dataclasses import dataclass
+from datetime import datetime
+from uuid import UUID
+
+from application.ports import ChatMessage
+from application.ports.mappers import ChatMessageMapper
+from domain.entities.actor import ActorId
+from domain.entities.chat import ChatId
+from domain.entities.message import MessageAuthorKind, MessageId
+from utils import ensure_utc_datetime
+
+
+@dataclass(frozen=True)
+class RedisChatMessageDTO:
+    runtime_id: str
+    chat_id: str
+    author_id: str
+    author_display_name: str
+    content: str
+    created_at: str
+    author_kind: str
+    reply_to_message_id: int | None = None
+
+
+class RedisChatMessageMapper(ChatMessageMapper[RedisChatMessageDTO]):
+    def to_dto(self, message: ChatMessage) -> RedisChatMessageDTO:
+        if message.runtime_id is None or message.author_id is None:
+            raise ValueError("Runtime chat message requires runtime_id and author_id")
+
+        return RedisChatMessageDTO(
+            runtime_id=message.runtime_id,
+            chat_id=str(message.chat_id.value),
+            author_id=str(message.author_id.value),
+            author_display_name=message.author_display_name or "",
+            content=message.content,
+            created_at=ensure_utc_datetime(message.created_at).isoformat(),
+            author_kind=message.author_kind.value,
+            reply_to_message_id=(
+                message.reply_to_message_id.value
+                if message.reply_to_message_id is not None
+                else None
+            ),
+        )
+
+    def to_message(self, dto: RedisChatMessageDTO) -> ChatMessage:
+        return ChatMessage(
+            chat_id=ChatId(UUID(dto.chat_id)),
+            content=dto.content,
+            created_at=ensure_utc_datetime(datetime.fromisoformat(dto.created_at)),
+            author_kind=MessageAuthorKind(dto.author_kind),
+            runtime_id=dto.runtime_id,
+            author_id=ActorId(UUID(dto.author_id)),
+            author_display_name=dto.author_display_name,
+            reply_to_message_id=(
+                MessageId(dto.reply_to_message_id)
+                if dto.reply_to_message_id is not None
+                else None
+            ),
+            persisted=False,
+        )
+
+src/infrastructure/chat_session/registry.py
+
+import asyncio
+
+from application.ports import ChatRoom, ChatRoomRegistry
+from domain.entities.chat import ChatId
+
+
+class InMemoryChatRoomRegistry(ChatRoomRegistry):
+    def __init__(self) -> None:
+        self._rooms: dict[ChatId, ChatRoom] = {}
+        self._locks: dict[ChatId, asyncio.Lock] = {}
+
+    async def get(self, chat_id: ChatId) -> ChatRoom | None:
+        return self._rooms.get(chat_id)
+
+    async def register(self, chat_id: ChatId, room: ChatRoom) -> ChatRoom:
+        lock = self._locks.setdefault(chat_id, asyncio.Lock())
+        async with lock:
+            return self._rooms.setdefault(chat_id, room)
+
+    async def remove(self, chat_id: ChatId) -> None:
+        self._rooms.pop(chat_id, None)
+        self._locks.pop(chat_id, None)
+
+    def get_all(self) -> dict[ChatId, ChatRoom]:
+        return dict(self._rooms)
+
+src/infrastructure/chat_session/room.py
+
+from collections.abc import Awaitable, Callable
+import asyncio
+from uuid import uuid4
+
+from application.exceptions import ConnectionClosedError
+from application.ports import (
+    ChatErrorEvent,
+    ChatConnection,
+    ChatMemberJoinedEvent,
+    ChatMemberLeftEvent,
+    ChatMessage,
+    ChatMessageCreatedEvent,
+    ChatRoomEventPublisher,
+    ChatRoom,
+    ChatRuntimeStore,
+    Clock,
+    PingCommand,
+    PongEvent,
+    SendChatMessageCommand,
+)
+from domain.entities.actor import Actor, ActorId
+from domain.entities.chat import ChatId
+from domain.entities.message import MessageAuthorKind, MessageId
+
+
+class LiveChatRoom(ChatRoom):
+    def __init__(
+        self,
+        chat_id: ChatId,
+        runtime_store: ChatRuntimeStore,
+        clock: Clock,
+        event_publisher: ChatRoomEventPublisher,
+    ) -> None:
+        self._chat_id = chat_id
+        self._runtime_store = runtime_store
+        self._clock = clock
+        self._events = event_publisher
+        self._dirty = False
+        self._lock = asyncio.Lock()
+        self._connections: dict[int, ChatConnection] = {}
+        self._connection_owners: dict[int, ActorId] = {}
+
+    @property
+    def chat_id(self) -> ChatId:
+        return self._chat_id
+
+    @property
+    def is_dirty(self) -> bool:
+        return self._dirty
+
+    @property
+    def is_empty(self) -> bool:
+        return not self._connections
+
+    async def pending_messages(self) -> list[ChatMessage]:
+        return await self._runtime_store.list_pending_messages(self._chat_id)
+
+    async def mark_persisted(self, runtime_ids: list[str]) -> None:
+        await self._runtime_store.delete_pending_messages(self._chat_id, runtime_ids)
+
+    def mark_clean(self) -> None:
+        self._dirty = False
+
+    async def serve(self, actor: Actor, connection: ChatConnection) -> None:
+        await self._join(actor, connection)
+        try:
+            while True:
+                command = await connection.receive()
+                await self._handle_command(actor, connection, command)
+        except ConnectionClosedError:
+            return
+        finally:
+            await self._leave(actor, connection)
+
+    async def disconnect_actor(self, actor_id: ActorId) -> int:
+        async with self._lock:
+            actor_connections = [
+                connection
+                for connection_id, connection in self._connections.items()
+                if self._connection_owners.get(connection_id) == actor_id
+            ]
+
+        disconnected_count = 0
+        for connection in actor_connections:
+            try:
+                await connection.close()
+            except ConnectionClosedError:
+                continue
+            disconnected_count += 1
+        return disconnected_count
+
+    async def _join(self, actor: Actor, connection: ChatConnection) -> None:
+        async with self._lock:
+            connection_id = id(connection)
+            self._connections[connection_id] = connection
+            self._connection_owners[connection_id] = actor.id
+            peers = list(self._connections.values())
+
+        await self._broadcast(
+            ChatMemberJoinedEvent(
+                chat_id=self._chat_id,
+                actor_id=actor.id,
+                display_name=actor.display_name.value,
+            ),
+            peers,
+        )
+
+    async def _leave(self, actor: Actor, connection: ChatConnection) -> None:
+        async with self._lock:
+            connection_id = id(connection)
+            self._connections.pop(connection_id, None)
+            self._connection_owners.pop(connection_id, None)
+            peers = list(self._connections.values())
+
+        await self._broadcast(
+            ChatMemberLeftEvent(
+                chat_id=self._chat_id,
+                actor_id=actor.id,
+                display_name=actor.display_name.value,
+            ),
+            peers,
+        )
+
+    async def _handle_command(
+        self,
+        actor: Actor,
+        connection: ChatConnection,
+        command: PingCommand | SendChatMessageCommand,
+    ) -> None:
+        if isinstance(command, PingCommand):
+            await connection.send(PongEvent())
+            return
+        if not isinstance(command, SendChatMessageCommand):
+            await connection.send(
+                ChatErrorEvent(
+                    code="invalid_event",
+                    message="Unsupported event type",
+                )
+            )
+            return
+
+        if not command.content.strip():
+            await connection.send(
+                ChatErrorEvent(
+                    code="invalid_message",
+                    message="Message content cannot be empty",
+                )
+            )
+            return
+
+        runtime_message = ChatMessage(
+            chat_id=self._chat_id,
+            content=command.content.strip(),
+            created_at=self._clock.now(),
+            author_kind=MessageAuthorKind.USER,
+            runtime_id=str(uuid4()),
+            author_id=actor.id,
+            author_display_name=actor.display_name.value,
+            reply_to_message_id=command.reply_to_message_id,
+            persisted=False,
+        )
+        await self._runtime_store.append_pending_message(runtime_message)
+        self._dirty = True
+        await self._broadcast(
+            ChatMessageCreatedEvent(message=runtime_message),
+            list(self._connections.values()),
+        )
+        await self._events.publish_room_modified(self._chat_id)
+
+    async def _broadcast(
+        self,
+        event: ChatMemberJoinedEvent | ChatMemberLeftEvent | ChatMessageCreatedEvent,
+        connections: list[ChatConnection],
+    ) -> None:
+        for peer in connections:
+            try:
+                await peer.send(event)
+            except ConnectionClosedError:
+                continue
+
+src/infrastructure/chat_session/runtime_store.py
+
+import json
+
+from redis.asyncio import Redis
+
+from application.ports import ChatMessage, ChatRuntimeStore
+from domain.entities.actor import ActorId
+from domain.entities.chat import ChatId
+from infrastructure.exceptions import network_error_aware
+
+from .mappers import RedisChatMessageDTO, RedisChatMessageMapper
+
+
+class RedisChatRuntimeStore(ChatRuntimeStore):
+    def __init__(
+        self,
+        redis: Redis,
+        mapper: RedisChatMessageMapper,
+    ) -> None:
+        self._redis = redis
+        self._mapper = mapper
+
+    def _pending_order_key(self, chat_id: ChatId) -> str:
+        return f"chat:room:{chat_id.value}:pending:order"
+
+    def _pending_payloads_key(self, chat_id: ChatId) -> str:
+        return f"chat:room:{chat_id.value}:pending:payloads"
+
+    def _active_members_key(self, chat_id: ChatId) -> str:
+        return f"chat:room:{chat_id.value}:members"
+
+    @network_error_aware("Cannot append pending chat message")
+    async def append_pending_message(self, message: ChatMessage) -> None:
+        dto = self._mapper.to_dto(message)
+        payload = json.dumps(dto.__dict__)
+        pipeline = self._redis.pipeline(transaction=True)
+        pipeline.hset(
+            self._pending_payloads_key(message.chat_id),
+            dto.runtime_id,
+            payload,
+        )
+        pipeline.rpush(
+            self._pending_order_key(message.chat_id),
+            dto.runtime_id,
+        )
+        await pipeline.execute()
+
+    @network_error_aware("Cannot load pending chat messages")
+    async def list_pending_messages(self, chat_id: ChatId) -> list[ChatMessage]:
+        runtime_ids = await self._redis.lrange(self._pending_order_key(chat_id), 0, -1)
+        if not runtime_ids:
+            return []
+
+        payloads = await self._redis.hmget(self._pending_payloads_key(chat_id), runtime_ids)
+        messages: list[ChatMessage] = []
+        for raw_payload in payloads:
+            if raw_payload is None:
+                continue
+            payload = json.loads(raw_payload)
+            messages.append(self._mapper.to_message(RedisChatMessageDTO(**payload)))
+        return messages
+
+    @network_error_aware("Cannot delete pending chat messages")
+    async def delete_pending_messages(
+        self, chat_id: ChatId, runtime_ids: list[str]
+    ) -> None:
+        if not runtime_ids:
+            return
+
+        pipeline = self._redis.pipeline(transaction=True)
+        for runtime_id in runtime_ids:
+            pipeline.lrem(self._pending_order_key(chat_id), 1, runtime_id)
+        pipeline.hdel(self._pending_payloads_key(chat_id), *runtime_ids)
+        await pipeline.execute()
+
+    @network_error_aware("Cannot add active chat member")
+    async def add_active_member(self, chat_id: ChatId, actor_id: ActorId) -> None:
+        await self._redis.sadd(self._active_members_key(chat_id), str(actor_id.value))
+
+    @network_error_aware("Cannot remove active chat member")
+    async def remove_active_member(self, chat_id: ChatId, actor_id: ActorId) -> None:
+        await self._redis.srem(self._active_members_key(chat_id), str(actor_id.value))
+
+    @network_error_aware("Cannot clear chat runtime state")
+    async def clear_room(self, chat_id: ChatId) -> None:
+        await self._redis.delete(
+            self._pending_order_key(chat_id),
+            self._pending_payloads_key(chat_id),
+            self._active_members_key(chat_id),
+        )
+
+src/infrastructure/chat_session/save_policies/__init__.py
+
+from .composite import CompositeChatSessionSavePolicy
+from .debounce import DebounceChatSessionSavePolicy
+from .periodic import PeriodicChatSessionSavePolicy
+
+src/infrastructure/chat_session/save_policies/composite.py
+
+from application.ports import ChatSessionSavePolicy
+from domain.entities.chat import ChatId
+
+
+class CompositeChatSessionSavePolicy(ChatSessionSavePolicy):
+    def __init__(self, policies: list[ChatSessionSavePolicy]) -> None:
+        self._policies = policies
+
+    async def start(self) -> None:
+        for policy in self._policies:
+            await policy.start()
+
+    async def stop(self) -> None:
+        for policy in self._policies:
+            await policy.stop()
+
+    async def on_room_modified(self, chat_id: ChatId) -> None:
+        for policy in self._policies:
+            await policy.on_room_modified(chat_id)
+
+    async def on_room_closed(self, chat_id: ChatId) -> None:
+        for policy in self._policies:
+            await policy.on_room_closed(chat_id)
+
+src/infrastructure/chat_session/save_policies/debounce.py
+
+import asyncio
+import time
+
+from application.ports import ChatSessionSavePolicy
+from application.services import ChatRoomSaver
+from domain.entities.chat import ChatId
+
+
+class DebounceChatSessionSavePolicy(ChatSessionSavePolicy):
+    def __init__(
+        self,
+        room_saver: ChatRoomSaver,
+        delay: float = 5.0,
+        check_interval: float = 1.0,
+    ) -> None:
+        self._room_saver = room_saver
+        self._delay = delay
+        self._check_interval = check_interval
+        self._last_modified: dict[ChatId, float] = {}
+        self._watchers: dict[ChatId, asyncio.Task[None]] = {}
+
+    async def start(self) -> None:
+        return None
+
+    async def stop(self) -> None:
+        for task in self._watchers.values():
+            task.cancel()
+        if self._watchers:
+            await asyncio.gather(*self._watchers.values(), return_exceptions=True)
+        self._watchers.clear()
+        self._last_modified.clear()
+
+    async def on_room_modified(self, chat_id: ChatId) -> None:
+        self._last_modified[chat_id] = time.monotonic()
+        if chat_id not in self._watchers:
+            self._watchers[chat_id] = asyncio.create_task(self._watch(chat_id))
+
+    async def on_room_closed(self, chat_id: ChatId) -> None:
+        self._last_modified.pop(chat_id, None)
+        task = self._watchers.pop(chat_id, None)
+        if task is not None:
+            task.cancel()
+
+    async def _watch(self, chat_id: ChatId) -> None:
+        try:
+            while True:
+                await asyncio.sleep(self._check_interval)
+                last_modified = self._last_modified.get(chat_id)
+                if last_modified is None:
+                    return
+                if time.monotonic() - last_modified >= self._delay:
+                    await self._room_saver.save_if_dirty(chat_id)
+                    self._last_modified.pop(chat_id, None)
+                    return
+        except asyncio.CancelledError:
+            return
+        finally:
+            self._watchers.pop(chat_id, None)
+
+src/infrastructure/chat_session/save_policies/periodic.py
+
+import asyncio
+
+from application.ports import ChatRoomRegistry, ChatSessionSavePolicy
+from application.services import ChatRoomSaver
+from domain.entities.chat import ChatId
+
+
+class PeriodicChatSessionSavePolicy(ChatSessionSavePolicy):
+    def __init__(
+        self,
+        room_saver: ChatRoomSaver,
+        registry: ChatRoomRegistry,
+        interval: float = 30.0,
+        max_concurrent: int = 20,
+    ) -> None:
+        self._room_saver = room_saver
+        self._registry = registry
+        self._interval = interval
+        self._semaphore = asyncio.Semaphore(max_concurrent)
+        self._task: asyncio.Task[None] | None = None
+
+    async def start(self) -> None:
+        if self._task is None:
+            self._task = asyncio.create_task(self._loop(), name="chat-periodic-save")
+
+    async def stop(self) -> None:
+        if self._task is None:
+            return
+        self._task.cancel()
+        try:
+            await self._task
+        except asyncio.CancelledError:
+            pass
+        self._task = None
+
+    async def on_room_modified(self, chat_id: ChatId) -> None:
+        return None
+
+    async def on_room_closed(self, chat_id: ChatId) -> None:
+        return None
+
+    async def _loop(self) -> None:
+        while True:
+            await asyncio.sleep(self._interval)
+            await self._save_all_dirty()
+
+    async def _save_all_dirty(self) -> None:
+        tasks: list[asyncio.Task[None]] = []
+        for chat_id, room in self._registry.get_all().items():
+            if not room.is_dirty:
+                continue
+            tasks.append(asyncio.create_task(self._save_with_limit(chat_id)))
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _save_with_limit(self, chat_id: ChatId) -> None:
+        async with self._semaphore:
+            await self._room_saver.save_if_dirty(chat_id)
+
+src/infrastructure/exceptions/__init__.py
+
+from .common import create_error_aware_decorator, error_aware
+from .error_aware_decorators import network_error_aware, stale_data_error_aware
+
+src/infrastructure/exceptions/common.py
+
+import functools
+import inspect
+import logging
+from collections.abc import Callable
+
+from application.exceptions import ApplicationError
+
+logger = logging.getLogger(__name__)
+
+type ErrorFactory = Callable[[Exception], ApplicationError]
+
+
+def error_aware(
+    error_map: dict[type[BaseException] | frozenset[type[BaseException]], ErrorFactory],
+):
+    flattened_error_map: dict[type[BaseException], ErrorFactory] = {}
+    for raw, factory in error_map.items():
+        if isinstance(raw, frozenset):
+            for error_type in raw:
+                flattened_error_map[error_type] = factory
+        else:
+            flattened_error_map[raw] = factory
+
+    def decorator[T, **P](func: Callable[P, T]) -> Callable[P, T]:
+        def handle_error(unknown: Exception) -> None:
+            target_name = func.__qualname__
+            factory = flattened_error_map.get(type(unknown))
+            if factory is None:
+                raise
+
+            application_error = factory(unknown)
+            logger.error(
+                "Infrastructure exception '%s' caught in '%s'. Converting to '%s'.",
+                type(unknown).__name__,
+                target_name,
+                type(application_error).__name__,
+            )
+            raise application_error from unknown
+
+        @functools.wraps(func)
+        def sync_handler(*args: P.args, **kwargs: P.kwargs) -> T:
+            try:
+                return func(*args, **kwargs)
+            except Exception as exc:
+                handle_error(exc)
+
+        @functools.wraps(func)
+        async def async_handler(*args: P.args, **kwargs: P.kwargs) -> T:
+            try:
+                return await func(*args, **kwargs)
+            except Exception as exc:
+                handle_error(exc)
+
+        return async_handler if inspect.iscoroutinefunction(func) else sync_handler
+
+    return decorator
+
+
+def create_error_aware_decorator(
+    base_error_map: dict[
+        type[Exception] | frozenset[type[Exception]],
+        type[ApplicationError],
+    ],
+):
+    def outer(default_message: str | None = None):
+        def decorator(func=None, *, error_map=None):
+            final_map = base_error_map.copy()
+            if error_map:
+                final_map.update(error_map)
+
+            factory_map = {
+                key: (
+                    (lambda error_cls: (lambda error: error_cls(str(error))))(value)
+                    if default_message is None
+                    else (lambda error_cls: (lambda _: error_cls(default_message)))(value)
+                )
+                for key, value in final_map.items()
+            }
+
+            return error_aware(factory_map)(func) if func else error_aware(factory_map)
+
+        return decorator
+
+    return outer
+
+src/infrastructure/exceptions/error_aware_decorators.py
+
+from redis.exceptions import ConnectionError as RedisConnectionError
+from sqlalchemy.exc import InterfaceError, OperationalError
+
+from application.exceptions import GatewayFailedError, InconsistentDataError
+
+from .common import create_error_aware_decorator
+
+network_error_aware = create_error_aware_decorator(
+    {
+        frozenset(
+            {
+                ConnectionRefusedError,
+                ConnectionResetError,
+                InterfaceError,
+                OperationalError,
+                RedisConnectionError,
+            }
+        ): GatewayFailedError
+    }
+)
+
+stale_data_error_aware = create_error_aware_decorator({})
+
+src/infrastructure/models/__init__.py
+
+from .actor import Actor
+from .base import Base
+from .chat import Chat
+from .chat_membership import ChatMembership
+from .message import Message
+
+src/infrastructure/models/actor.py
+
+from uuid import UUID
+
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from .base import Base
+from .chat_membership import ChatMembership
+
+
+class Actor(Base):
+    id: Mapped[UUID] = mapped_column(primary_key=True)
+    display_name: Mapped[str] = mapped_column(nullable=False)
+    public_id: Mapped[str] = mapped_column(nullable=False, unique=True)
+
+    memberships: Mapped[list[ChatMembership]] = relationship(
+        back_populates="actor",
+        lazy="selectin",
+    )
+
+src/infrastructure/models/base.py
+
+from sqlalchemy import MetaData
+from sqlalchemy.orm import DeclarativeBase, declared_attr
+
+from utils import camel_case_to_snake_case
+
+NAMING_CONVENTION = {
+    "ix": "ix_%(column_0_label)s",
+    "uq": "uq_%(table_name)s_%(column_0_N_name)s",
+    "ck": "ck_%(table_name)s_%(constraint_name)s",
+    "fk": "fk_%(table_name)s_%(column_0_name)s_%(referred_table_name)s",
+    "pk": "pk_%(table_name)s",
+}
+
+
+class Base(DeclarativeBase):
+    __abstract__ = True
+
+    metadata = MetaData(naming_convention=NAMING_CONVENTION)
+
+    @declared_attr.directive
+    def __tablename__(cls) -> str:
+        return f"{camel_case_to_snake_case(cls.__name__)}s"
+
+src/infrastructure/models/chat.py
+
+from datetime import datetime
+from uuid import UUID
+
+from sqlalchemy import DateTime, String, UniqueConstraint
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from .base import Base
+from .chat_membership import ChatMembership
+from .message import Message
+
+
+class Chat(Base):
+    id: Mapped[UUID] = mapped_column(primary_key=True)
+    name: Mapped[str | None] = mapped_column(nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    context_kind: Mapped[str] = mapped_column(String(50), nullable=False)
+    context_external_id: Mapped[str] = mapped_column(String(255), nullable=False)
+
+    members: Mapped[list[ChatMembership]] = relationship(
+        back_populates="chat",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+    )
+    messages: Mapped[list[Message]] = relationship(
+        back_populates="chat",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+    )
+    __table_args__ = (UniqueConstraint("context_kind", "context_external_id"),)
+
+src/infrastructure/models/chat_membership.py
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+from uuid import UUID
+from datetime import datetime
+
+from sqlalchemy import DateTime, ForeignKey
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from .base import Base
+
+if TYPE_CHECKING:
+    from .actor import Actor
+    from .chat import Chat
+
+
+class ChatMembership(Base):
+    chat_id: Mapped[UUID] = mapped_column(
+        ForeignKey("chats.id", ondelete="CASCADE"), primary_key=True
+    )
+    actor_id: Mapped[UUID] = mapped_column(
+        ForeignKey("actors.id", ondelete="CASCADE"), primary_key=True
+    )
+    joined_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    chat: Mapped[Chat] = relationship(back_populates="members")
+    actor: Mapped[Actor] = relationship(back_populates="memberships")
+
+src/infrastructure/models/message.py
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+from datetime import datetime
+from uuid import UUID
+
+from domain.entities.message import MessageAuthorKind
+from sqlalchemy import DateTime, Enum, ForeignKey, LargeBinary
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from .base import Base
+
+if TYPE_CHECKING:
+    from .actor import Actor
+    from .chat import Chat
+
+
+class Message(Base):
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    runtime_id: Mapped[str | None] = mapped_column(nullable=True, unique=True, index=True)
+    content: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    chat_id: Mapped[UUID] = mapped_column(
+        ForeignKey("chats.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    author_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("actors.id", ondelete="SET NULL"), nullable=True
+    )
+    author_kind: Mapped[MessageAuthorKind] = mapped_column(
+        Enum(MessageAuthorKind), nullable=False
+    )
+    reply_to_message_id: Mapped[int | None] = mapped_column(
+        ForeignKey("messages.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    chat: Mapped[Chat] = relationship(back_populates="messages")
+    author: Mapped[Actor | None] = relationship(lazy="selectin")
+
+src/infrastructure/subscribers/__init__.py
+
+
+
+src/infrastructure/subscribers/chat/__init__.py
+
+from .project_created import chat_sub_router
+
+src/infrastructure/subscribers/chat/models.py
+
+from pydantic import BaseModel
+
+
+class UserCreated(BaseModel):
+    user_id: str
+    name: str
+    email: str
+
+    model_config = {"extra": "ignore"}
+
+
+class ProjectCreated(BaseModel):
+    project_id: str
+    owner_id: str
+
+    model_config = {"extra": "ignore"}
+
+
+class ProjectMemberAdded(BaseModel):
+    project_id: str
+    member_id: str
+
+    model_config = {"extra": "ignore"}
+
+
+class ProjectMemberRemoved(BaseModel):
+    project_id: str
+    member_id: str
+
+    model_config = {"extra": "ignore"}
+
+
+class ProjectTaskCreated(BaseModel):
+    project_id: str
+    task_id: str
+    title: str | None = None
+
+    model_config = {"extra": "ignore"}
+
+
+class ProjectTaskStatusChanged(BaseModel):
+    project_id: str
+    task_id: str
+    status: str
+    title: str | None = None
+
+    model_config = {"extra": "ignore"}
+
+src/infrastructure/subscribers/chat/project_created.py
+
+import logging
+from uuid import UUID
+
+from dishka.integrations.faststream import FromDishka, inject
+from faststream.kafka import KafkaRouter
+
+from application.compositions import (
+    AddProjectMemberComposition,
+    CreateActorComposition,
+    CreateProjectChatComposition,
+    RemoveChatMemberComposition,
+    RemoveChatMemberCompositionRequest,
+)
+from application.ports import UnitOfWork
+from application.usecases import (
+    CreateActorRequest,
+    CreateChatRequest,
+    CreateChatUsecase,
+    CreateSystemMessageRequest,
+    CreateSystemMessageUsecase,
+)
+from application.compositions.add_project_member import AddProjectMemberRequest
+from application.compositions.create_project_chat import CreateProjectChatRequest
+from domain.entities.actor import ActorId
+from domain.entities.chat import ContextKind
+from domain.exceptions import DomainFieldError
+
+from .models import (
+    ProjectCreated,
+    ProjectTaskCreated,
+    ProjectTaskStatusChanged,
+    ProjectMemberAdded,
+    ProjectMemberRemoved,
+    UserCreated,
+)
+
+logger = logging.getLogger(__name__)
+
+chat_sub_router = KafkaRouter()
+
+
+@chat_sub_router.subscriber(
+    "user.created", group_id="chat-service", auto_offset_reset="earliest"
+)
+@inject
+async def create_actor(
+    usecase: FromDishka[CreateActorComposition], message: UserCreated
+) -> None:
+    try:
+        response = await usecase(
+            CreateActorRequest.from_primitives(
+                actor_id=message.user_id,
+                display_name=message.name,
+                email=message.email,
+            )
+        )
+    except KeyError:
+        raise DomainFieldError("Received wrong data")
+
+    if response.was_created:
+        logger.info("Created actor %s", message.user_id)
+    else:
+        logger.info("Actor %s already exists", message.user_id)
+
+
+@chat_sub_router.subscriber(
+    "project.created", group_id="chat-service", auto_offset_reset="earliest"
+)
+@inject
+async def create_project_chat(
+    usecase: FromDishka[CreateProjectChatComposition], message: ProjectCreated
+) -> None:
+    try:
+        response = await usecase(
+            CreateProjectChatRequest(
+                chat=CreateChatRequest.from_primitives(
+                    name=None,
+                    context_kind=ContextKind.PROJECT,
+                    ref=message.project_id,
+                ),
+                owner_id=ActorId(UUID(message.owner_id)),
+            )
+        )
+    except KeyError:
+        raise DomainFieldError("Received wrong data")
+
+    if response.chat_was_created:
+        logger.info("Created chat for project %s", message.project_id)
+    else:
+        logger.info("Chat for project %s already exists", message.project_id)
+
+
+@chat_sub_router.subscriber(
+    "project.member_added", group_id="chat-service", auto_offset_reset="earliest"
+)
+@inject
+async def add_project_member(
+    usecase: FromDishka[AddProjectMemberComposition], message: ProjectMemberAdded
+) -> None:
+    try:
+        response = await usecase(
+            AddProjectMemberRequest(
+                chat=CreateChatRequest.from_primitives(
+                    name=None,
+                    context_kind=ContextKind.PROJECT,
+                    ref=message.project_id,
+                ),
+                actor_id=ActorId(UUID(message.member_id)),
+            )
+        )
+    except KeyError:
+        raise DomainFieldError("Received wrong data")
+
+    if response.member_was_added:
+        logger.info(
+            "Added actor %s to project chat %s", message.member_id, message.project_id
+        )
+    else:
+        logger.info(
+            "Actor %s already belongs to project chat %s",
+            message.member_id,
+            message.project_id,
+        )
+
+
+@chat_sub_router.subscriber(
+    "project.member_removed", group_id="chat-service", auto_offset_reset="earliest"
+)
+@inject
+async def remove_project_member(
+    usecase: FromDishka[RemoveChatMemberComposition], message: ProjectMemberRemoved
+) -> None:
+    try:
+        response = await usecase(
+            RemoveChatMemberCompositionRequest(
+                context=CreateChatRequest.from_primitives(
+                    name=None,
+                    context_kind=ContextKind.PROJECT,
+                    ref=message.project_id,
+                ).context,
+                actor_id=ActorId(UUID(message.member_id)),
+            )
+        )
+    except KeyError:
+        raise DomainFieldError("Received wrong data")
+
+    if response.member_was_removed:
+        logger.info(
+            "Removed actor %s from project chat %s", message.member_id, message.project_id
+        )
+    else:
+        logger.info(
+            "Actor %s was already absent in project chat %s",
+            message.member_id,
+            message.project_id,
+        )
+
+
+@chat_sub_router.subscriber(
+    "project.task.created", group_id="chat-service", auto_offset_reset="earliest"
+)
+@inject
+async def notify_project_task_created(
+    create_chat_usecase: FromDishka[CreateChatUsecase],
+    create_system_message_usecase: FromDishka[CreateSystemMessageUsecase],
+    unit_of_work: FromDishka[UnitOfWork],
+    message: ProjectTaskCreated,
+) -> None:
+    short_task_id = message.task_id[:6]
+    task_label = (
+        f'"{message.title}" ({short_task_id})' if message.title else short_task_id
+    )
+    async with unit_of_work:
+        chat = await create_chat_usecase(
+            CreateChatRequest.from_primitives(
+                name=None,
+                context_kind=ContextKind.PROJECT,
+                ref=message.project_id,
+            )
+        )
+        await create_system_message_usecase(
+            CreateSystemMessageRequest(
+                chat_id=chat.chat_id,
+                content=f"Task created: {task_label}",
+            )
+            )
+    logger.info("Published task-created message in project chat %s", message.project_id)
+
+
+@chat_sub_router.subscriber(
+    "project.task.status_changed", group_id="chat-service", auto_offset_reset="earliest"
+)
+@inject
+async def notify_project_task_status_changed(
+    create_chat_usecase: FromDishka[CreateChatUsecase],
+    create_system_message_usecase: FromDishka[CreateSystemMessageUsecase],
+    unit_of_work: FromDishka[UnitOfWork],
+    message: ProjectTaskStatusChanged,
+) -> None:
+    short_task_id = message.task_id[:6]
+    task_label = (
+        f'"{message.title}" ({short_task_id})' if message.title else short_task_id
+    )
+    async with unit_of_work:
+        chat = await create_chat_usecase(
+            CreateChatRequest.from_primitives(
+                name=None,
+                context_kind=ContextKind.PROJECT,
+                ref=message.project_id,
+            )
+        )
+        await create_system_message_usecase(
+            CreateSystemMessageRequest(
+                chat_id=chat.chat_id,
+                content=f"Task {task_label} moved to {message.status}",
+            )
+        )
+    logger.info(
+        "Published task-status message in project chat %s",
+        message.project_id,
+    )
+
+src/infrastructure/subscribers/middlewares/__init__.py
+
+__all__: list[str] = []
+
+src/main.py
+
+from pathlib import Path
+import sys
+
+SRC_DIR = Path(__file__).parent / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+
+def build_app():
+    from app_factory import create_app
+
+    return create_app()
+
+
+app = build_app()
+
+if __name__ == "__main__":
+    import uvicorn
+    from setup.config import settings
+
+    uvicorn.run(app, host=settings.run.host, port=settings.run.port, reload=False)
+
+src/presentation/__init__.py
+
+from .presenters import AccessAuthInfo, JwtAccessTokenPresenter
+from .presenters import ChatHistoryCursor, CursorEncrypter, FernetCursorEncrypter
+
+src/presentation/exceptions.py
+
+class PresentationError(Exception): ...
+
+
+class InvalidAccessTokenError(PresentationError): ...
+
+
+class ExpiredAccessTokenError(PresentationError): ...
+
+
+class InvalidCursorError(PresentationError): ...
+
+src/presentation/handlers/__init__.py
+
+from .chat_session import ChatSessionHandler
+from .chat_membership_self_join import (
+    JoinChatMembershipHandler,
+    JoinChatMembershipRequest,
+)
+from .chat_membership_self_leave import (
+    LeaveChatMembershipHandler,
+    LeaveChatMembershipRequest,
+)
+from .chat_history import (
+    ChatHistoryHandler,
+    GetChatHistoryPageRequest,
+)
+
+src/presentation/handlers/chat_history.py
+
+from dataclasses import dataclass
+from uuid import UUID
+
+from application.compositions import (
+    GetChatHistoryComposition,
+    GetChatHistoryCompositionRequest,
+)
+from domain.entities.actor import ActorId
+from domain.entities.chat import ChatId
+from presentation.exceptions import InvalidAccessTokenError
+from presentation.models import ChatHistoryEvent, ChatMessageEvent
+from presentation.presenters import ChatHistoryCursor, CursorEncrypter, JwtAccessTokenPresenter
+from setup.config import Settings
+
+
+@dataclass(frozen=True)
+class GetChatHistoryPageRequest:
+    token: str
+    chat_id: str
+    limit: int
+    cursor: str | None = None
+
+
+class ChatHistoryHandler:
+    def __init__(
+        self,
+        settings: Settings,
+        token_presenter: JwtAccessTokenPresenter,
+        cursor_encrypter: CursorEncrypter,
+        composition: GetChatHistoryComposition,
+    ) -> None:
+        self._settings = settings
+        self._token_presenter = token_presenter
+        self._cursor_encrypter = cursor_encrypter
+        self._composition = composition
+
+    async def __call__(
+        self, request: GetChatHistoryPageRequest
+    ) -> ChatHistoryEvent:
+        auth_info = self._token_presenter.present(request.token)
+        try:
+            actor_id = ActorId(UUID(auth_info.user_id))
+        except ValueError as error:
+            raise InvalidAccessTokenError("Token contains invalid user_id") from error
+
+        try:
+            chat_id = ChatId(UUID(request.chat_id))
+        except ValueError as error:
+            raise InvalidAccessTokenError("Chat id is invalid") from error
+
+        before_cursor: ChatHistoryCursor | None = None
+        if request.cursor is not None:
+            before_cursor = self._cursor_encrypter.decrypt(request.cursor)
+
+        limit = min(max(request.limit, 1), self._settings.chat_session.history_limit)
+        response = await self._composition(
+            GetChatHistoryCompositionRequest(
+                chat_id=chat_id,
+                actor_id=actor_id,
+                limit=limit,
+                before_created_at=(
+                    before_cursor.before_created_at if before_cursor is not None else None
+                ),
+                before_message_id=(
+                    before_cursor.before_message_id if before_cursor is not None else None
+                ),
+            )
+        )
+
+        next_cursor: str | None = None
+        if (
+            response.has_more
+            and response.next_before_created_at is not None
+            and response.next_before_message_id is not None
+        ):
+            next_cursor = self._cursor_encrypter.encrypt(
+                ChatHistoryCursor(
+                    before_created_at=response.next_before_created_at,
+                    before_message_id=response.next_before_message_id,
+                )
+            )
+
+        return ChatHistoryEvent(
+            messages=[ChatMessageEvent.from_entity(message) for message in response.messages],
+            has_more=response.has_more,
+            next_cursor=next_cursor,
+        )
+
+src/presentation/handlers/chat_membership_self_join.py
+
+from dataclasses import dataclass
+from uuid import UUID
+
+from application.compositions import (
+    JoinChatMembershipComposition,
+    JoinChatMembershipCompositionRequest,
+)
+from domain.entities.actor import ActorId
+from domain.entities.chat import ContextKind, ContextRef
+from presentation.exceptions import InvalidAccessTokenError
+from presentation.models import ChatMemberJoinedEvent
+from presentation.presenters.auth import JwtAccessTokenPresenter
+
+
+@dataclass(frozen=True)
+class JoinChatMembershipRequest:
+    token: str
+    context_kind: ContextKind
+    context_external_id: str
+
+
+class JoinChatMembershipHandler:
+    def __init__(
+        self,
+        token_presenter: JwtAccessTokenPresenter,
+        composition: JoinChatMembershipComposition,
+    ) -> None:
+        self._token_presenter = token_presenter
+        self._composition = composition
+
+    async def __call__(self, request: JoinChatMembershipRequest) -> ChatMemberJoinedEvent:
+        auth_info = self._token_presenter.present(request.token)
+        try:
+            actor_id = ActorId(UUID(auth_info.user_id))
+        except ValueError as error:
+            raise InvalidAccessTokenError("Token contains invalid user_id") from error
+
+        response = await self._composition(
+            JoinChatMembershipCompositionRequest(
+                context=ContextRef(
+                    kind=request.context_kind,
+                    external_id=request.context_external_id,
+                ),
+                actor_id=actor_id,
+            )
+        )
+        return ChatMemberJoinedEvent(
+            chat_id=str(response.chat_id.value),
+            chat_was_created=response.chat_was_created,
+            member_was_added=response.member_was_added,
+        )
+
+src/presentation/handlers/chat_membership_self_leave.py
+
+from dataclasses import dataclass
+from uuid import UUID
+
+from application.compositions import (
+    RemoveChatMemberComposition,
+    RemoveChatMemberCompositionRequest,
+)
+from domain.entities.actor import ActorId
+from domain.entities.chat import ContextKind, ContextRef
+from presentation.exceptions import InvalidAccessTokenError
+from presentation.models import ChatMemberLeavedEvent
+from presentation.presenters.auth import JwtAccessTokenPresenter
+
+
+@dataclass(frozen=True)
+class LeaveChatMembershipRequest:
+    token: str
+    context_kind: ContextKind
+    context_external_id: str
+
+
+class LeaveChatMembershipHandler:
+    def __init__(
+        self,
+        token_presenter: JwtAccessTokenPresenter,
+        composition: RemoveChatMemberComposition,
+    ) -> None:
+        self._token_presenter = token_presenter
+        self._composition = composition
+
+    async def __call__(
+        self, request: LeaveChatMembershipRequest
+    ) -> ChatMemberLeavedEvent:
+        auth_info = self._token_presenter.present(request.token)
+        try:
+            actor_id = ActorId(UUID(auth_info.user_id))
+        except ValueError as error:
+            raise InvalidAccessTokenError("Token contains invalid user_id") from error
+
+        response = await self._composition(
+            RemoveChatMemberCompositionRequest(
+                context=ContextRef(
+                    kind=request.context_kind,
+                    external_id=request.context_external_id,
+                ),
+                actor_id=actor_id,
+            )
+        )
+        return ChatMemberLeavedEvent(
+            chat_id=str(response.chat_id.value),
+            member_was_removed=response.member_was_removed,
+        )
+
+src/presentation/handlers/chat_session.py
+
+from application.ports import ChatConnection, ChatHistoryEvent
+from application.usecases import (
+    JoinChatRoomRequest,
+    JoinChatRoomUsecase,
+    ServeChatConnectionRequest,
+    ServeChatConnectionUsecase,
+)
+from domain.entities.actor import ActorId
+from domain.entities.chat import ContextKind, ContextRef
+from setup.config import Settings
+
+from uuid import UUID
+from presentation.exceptions import InvalidAccessTokenError
+from presentation.presenters.auth import JwtAccessTokenPresenter
+
+
+class ChatSessionHandler:
+    def __init__(
+        self,
+        settings: Settings,
+        token_presenter: JwtAccessTokenPresenter,
+        join_usecase: JoinChatRoomUsecase,
+        serve_usecase: ServeChatConnectionUsecase,
+    ) -> None:
+        self._settings = settings
+        self._token_presenter = token_presenter
+        self._join_usecase = join_usecase
+        self._serve_usecase = serve_usecase
+
+    async def __call__(
+        self,
+        token: str,
+        context_kind: ContextKind,
+        context_external_id: str,
+        connection: ChatConnection,
+    ) -> None:
+        auth_info = self._token_presenter.present(token)
+        try:
+            actor_id = ActorId(UUID(auth_info.user_id))
+        except ValueError as error:
+            raise InvalidAccessTokenError("Token contains invalid user_id") from error
+
+        joined = await self._join_usecase(
+            JoinChatRoomRequest(
+                context=ContextRef(
+                    kind=context_kind,
+                    external_id=context_external_id,
+                ),
+                actor_id=actor_id,
+                history_limit=self._settings.chat_session.history_limit,
+            )
+        )
+
+        await connection.accept()
+        await connection.send(
+            ChatHistoryEvent(chat_id=joined.room.chat_id, messages=joined.history)
+        )
+        await self._serve_usecase(
+            ServeChatConnectionRequest(
+                room=joined.room,
+                actor=joined.actor,
+                connection=connection,
+            )
+        )
+
+src/presentation/http/__init__.py
+
+from .controllers import chat_http_router
+
+src/presentation/http/controllers/__init__.py
+
+from .chats import router as chat_http_router
+
+src/presentation/http/controllers/chats.py
+
+from typing import Annotated
+
+from dishka.integrations.fastapi import FromDishka, inject
+from fastapi import APIRouter, HTTPException, Query
+
+from application.exceptions import (
+    ActorNotFoundError,
+    ChatMembershipForbiddenError,
+    ChatNotFoundError,
+)
+from presentation.exceptions import (
+    ExpiredAccessTokenError,
+    InvalidAccessTokenError,
+    InvalidCursorError,
+)
+from presentation.handlers import (
+    ChatHistoryHandler,
+    GetChatHistoryPageRequest,
+    JoinChatMembershipHandler,
+    JoinChatMembershipRequest,
+    LeaveChatMembershipHandler,
+    LeaveChatMembershipRequest,
+)
+from presentation.models import (
+    ChatMembershipContextPayload,
+    ChatHistoryEvent,
+    ChatMemberJoinedEvent,
+    ChatMemberLeavedEvent,
+)
+
+router = APIRouter()
+
+
+@router.get("/chats/{chat_id}/messages")
+@inject
+async def get_chat_messages(
+    chat_id: str,
+    token: Annotated[str, Query()],
+    handler: FromDishka[ChatHistoryHandler],
+    cursor: str | None = Query(default=None),
+    limit: int = Query(default=50, ge=1),
+) -> ChatHistoryEvent:
+    try:
+        return await handler(
+            GetChatHistoryPageRequest(
+                token=token,
+                chat_id=chat_id,
+                limit=limit,
+                cursor=cursor,
+            )
+        )
+    except InvalidCursorError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    except (InvalidAccessTokenError, ExpiredAccessTokenError) as error:
+        raise HTTPException(status_code=401, detail=str(error)) from error
+    except ChatNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except (ChatMembershipForbiddenError, ActorNotFoundError) as error:
+        raise HTTPException(status_code=403, detail=str(error)) from error
+
+
+@router.post("/chat-membership/self")
+@inject
+async def join_chat_membership(
+    payload: ChatMembershipContextPayload,
+    token: Annotated[str, Query()],
+    handler: FromDishka[JoinChatMembershipHandler],
+) -> ChatMemberJoinedEvent:
+    try:
+        return await handler(
+            JoinChatMembershipRequest(
+                token=token,
+                context_kind=payload.context_kind,
+                context_external_id=payload.context_external_id,
+            )
+        )
+    except (InvalidAccessTokenError, ExpiredAccessTokenError) as error:
+        raise HTTPException(status_code=401, detail=str(error)) from error
+    except ChatNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except (ChatMembershipForbiddenError, ActorNotFoundError) as error:
+        raise HTTPException(status_code=403, detail=str(error)) from error
+
+
+@router.delete("/chat-membership/self")
+@inject
+async def leave_chat_membership(
+    payload: ChatMembershipContextPayload,
+    token: Annotated[str, Query()],
+    handler: FromDishka[LeaveChatMembershipHandler],
+) -> ChatMemberLeavedEvent:
+    try:
+        return await handler(
+            LeaveChatMembershipRequest(
+                token=token,
+                context_kind=payload.context_kind,
+                context_external_id=payload.context_external_id,
+            )
+        )
+    except (InvalidAccessTokenError, ExpiredAccessTokenError) as error:
+        raise HTTPException(status_code=401, detail=str(error)) from error
+    except ChatNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except (ChatMembershipForbiddenError, ActorNotFoundError) as error:
+        raise HTTPException(status_code=403, detail=str(error)) from error
+
+src/presentation/models/__init__.py
+
+from .chat import (
+    ChatMembershipContextPayload,
+    ChatHistoryEvent,
+    ChatMemberJoinedEvent,
+    ChatMemberLeavedEvent,
+    ChatMessageEvent,
+)
+
+src/presentation/models/chat.py
+
+from datetime import datetime
+
+from pydantic import BaseModel
+
+from application.ports import ChatMessage
+from domain.entities.chat import ContextKind
+
+
+class ChatMembershipContextPayload(BaseModel):
+    context_kind: ContextKind
+    context_external_id: str
+
+
+class ChatMessageEvent(BaseModel):
+    chat_id: str
+    message_id: int | None
+    runtime_id: str | None
+    author_id: str | None
+    author_display_name: str | None
+    author_kind: str
+    content: str
+    created_at: datetime
+    reply_to_message_id: int | None
+    persisted: bool
+
+    @classmethod
+    def from_entity(cls, message: ChatMessage) -> "ChatMessageEvent":
+        return cls(
+            chat_id=str(message.chat_id.value),
+            message_id=message.message_id.value if message.message_id else None,
+            runtime_id=message.runtime_id,
+            author_id=str(message.author_id.value) if message.author_id else None,
+            author_display_name=message.author_display_name,
+            author_kind=message.author_kind.value,
+            content=message.content,
+            created_at=message.created_at,
+            reply_to_message_id=(
+                message.reply_to_message_id.value
+                if message.reply_to_message_id is not None
+                else None
+            ),
+            persisted=message.persisted,
+        )
+
+
+class ChatHistoryEvent(BaseModel):
+    messages: list[ChatMessageEvent]
+    has_more: bool
+    next_cursor: str | None
+
+
+class ChatMemberLeavedEvent(BaseModel):
+    chat_id: str
+    member_was_removed: bool
+
+
+class ChatMemberJoinedEvent(BaseModel):
+    chat_id: str
+    chat_was_created: bool
+    member_was_added: bool
+
+src/presentation/presenters/__init__.py
+
+from .auth import AccessAuthInfo, JwtAccessTokenPresenter
+from .cursor import ChatHistoryCursor, CursorEncrypter, FernetCursorEncrypter
+
+src/presentation/presenters/auth.py
+
+from dataclasses import dataclass
+from typing import Any
+
+import jwt
+
+from presentation.exceptions import ExpiredAccessTokenError, InvalidAccessTokenError
+
+
+@dataclass(frozen=True)
+class AccessAuthInfo:
+    key_id: str
+    user_id: str
+
+
+class JwtAccessTokenPresenter:
+    def __init__(self, public_key: str, algorithm: str) -> None:
+        self._public_key = public_key
+        self._algorithm = algorithm
+
+    def present(self, token: str) -> AccessAuthInfo:
+        try:
+            payload: dict[str, Any] = jwt.decode(
+                jwt=token,
+                key=self._public_key,
+                algorithms=[self._algorithm],
+            )
+        except jwt.exceptions.ExpiredSignatureError as error:
+            raise ExpiredAccessTokenError("Given access token is expired") from error
+        except jwt.exceptions.PyJWTError as error:
+            raise InvalidAccessTokenError("Invalid access token") from error
+
+        if payload.get("type") != "access":
+            raise InvalidAccessTokenError("Token is not access")
+
+        user_id = payload.get("user_id")
+        if not isinstance(user_id, str):
+            raise InvalidAccessTokenError("Token does not contain user_id")
+
+        key_id = payload.get("sub")
+        if not isinstance(key_id, str):
+            raise InvalidAccessTokenError("Token does not contain key id")
+
+        return AccessAuthInfo(key_id=key_id, user_id=user_id)
+
+src/presentation/presenters/cursor.py
+
+import json
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any, Protocol
+
+from cryptography.fernet import Fernet, InvalidToken
+
+from presentation.exceptions import InvalidCursorError
+
+
+@dataclass(frozen=True)
+class ChatHistoryCursor:
+    before_created_at: datetime
+    before_message_id: int
+
+
+class CursorEncrypter(Protocol):
+    def encrypt(self, cursor: ChatHistoryCursor) -> str: ...
+
+    def decrypt(self, token: str) -> ChatHistoryCursor: ...
+
+
+class FernetCursorEncrypter:
+    def __init__(self, key: str) -> None:
+        self._fernet = Fernet(key.encode("utf-8"))
+
+    def encrypt(self, cursor: ChatHistoryCursor) -> str:
+        payload = json.dumps(
+            {
+                "before_created_at": cursor.before_created_at.isoformat(),
+                "before_message_id": cursor.before_message_id,
+            }
+        )
+        token = self._fernet.encrypt(payload.encode("utf-8"))
+        return token.decode("utf-8")
+
+    def decrypt(self, token: str) -> ChatHistoryCursor:
+        try:
+            payload = self._fernet.decrypt(token.encode("utf-8")).decode("utf-8")
+            raw: dict[str, Any] = json.loads(payload)
+        except (InvalidToken, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise InvalidCursorError("Invalid cursor") from error
+
+        before_created_at = raw.get("before_created_at")
+        before_message_id = raw.get("before_message_id")
+        if not isinstance(before_created_at, str) or not isinstance(
+            before_message_id, int
+        ):
+            raise InvalidCursorError("Invalid cursor payload")
+        try:
+            created_at = datetime.fromisoformat(before_created_at)
+        except ValueError as error:
+            raise InvalidCursorError("Invalid cursor payload") from error
+
+        return ChatHistoryCursor(
+            before_created_at=created_at,
+            before_message_id=before_message_id,
+        )
+
+src/presentation/ws/__init__.py
+
+from .controllers import chat_ws_router
+
+src/presentation/ws/connection.py
+
+from starlette.websockets import WebSocket, WebSocketDisconnect
+
+from application.exceptions import ConnectionClosedError
+from application.ports import (
+    ChatErrorEvent,
+    ChatHistoryEvent,
+    ChatMemberJoinedEvent,
+    ChatMemberLeftEvent,
+    ChatMessage,
+    ChatMessageCreatedEvent,
+    ChatSessionCommand,
+    ChatSessionEvent,
+    PingCommand,
+    PongEvent,
+    SendChatMessageCommand,
+)
+from domain.entities.message import MessageId
+
+
+class StarletteChatConnectionAdapter:
+    def __init__(self, websocket: WebSocket) -> None:
+        self._websocket = websocket
+
+    async def accept(self) -> None:
+        await self._websocket.accept()
+
+    async def receive(self) -> ChatSessionCommand:
+        try:
+            payload = await self._websocket.receive_json()
+        except WebSocketDisconnect as error:
+            raise ConnectionClosedError from error
+        if not isinstance(payload, dict):
+            return PingCommand()
+
+        event_type = payload.get("type")
+        if event_type == "send_message":
+            return SendChatMessageCommand(
+                content=str(payload.get("content", "")),
+                reply_to_message_id=(
+                    MessageId(payload["reply_to_message_id"])
+                    if isinstance(payload.get("reply_to_message_id"), int)
+                    else None
+                ),
+            )
+        return PingCommand()
+
+    async def send(self, event: ChatSessionEvent) -> None:
+        try:
+            await self._websocket.send_json(self._serialize_event(event))
+        except WebSocketDisconnect as error:
+            raise ConnectionClosedError from error
+
+    async def close(self) -> None:
+        await self._websocket.close()
+
+    def _serialize_event(self, event: ChatSessionEvent) -> dict[str, object]:
+        if isinstance(event, PongEvent):
+            return {"type": "pong"}
+        if isinstance(event, ChatErrorEvent):
+            return {"type": "error", "code": event.code, "message": event.message}
+        if isinstance(event, ChatHistoryEvent):
+            return {
+                "type": "history",
+                "chat_id": str(event.chat_id.value),
+                "messages": [
+                    self._serialize_message(message) for message in event.messages
+                ],
+            }
+        if isinstance(event, ChatMessageCreatedEvent):
+            return {
+                "type": "message_created",
+                **self._serialize_message(event.message),
+            }
+        if isinstance(event, ChatMemberJoinedEvent):
+            return {
+                "type": "member_joined",
+                "chat_id": str(event.chat_id.value),
+                "actor_id": str(event.actor_id.value),
+                "display_name": event.display_name,
+            }
+        if isinstance(event, ChatMemberLeftEvent):
+            return {
+                "type": "member_left",
+                "chat_id": str(event.chat_id.value),
+                "actor_id": str(event.actor_id.value),
+                "display_name": event.display_name,
+            }
+        raise TypeError(f"Unsupported event type: {type(event).__name__}")
+
+    def _serialize_message(self, message: ChatMessage) -> dict[str, object]:
+        return {
+            "chat_id": str(message.chat_id.value),
+            "message_id": message.message_id.value if message.message_id else None,
+            "runtime_id": message.runtime_id,
+            "author_id": str(message.author_id.value) if message.author_id else None,
+            "author_display_name": message.author_display_name,
+            "author_kind": message.author_kind.value,
+            "content": message.content,
+            "created_at": message.created_at.isoformat(),
+            "reply_to_message_id": (
+                message.reply_to_message_id.value
+                if message.reply_to_message_id is not None
+                else None
+            ),
+            "persisted": message.persisted,
+        }
+
+src/presentation/ws/controllers/__init__.py
+
+from .chats import router as chat_ws_router
+
+src/presentation/ws/controllers/chats.py
+
+from typing import Annotated
+
+from dishka.integrations.fastapi import FromDishka, inject
+from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
+
+from application.exceptions import (
+    ActorNotFoundError,
+    ChatMembershipForbiddenError,
+    ChatNotFoundError,
+)
+from domain.entities.chat import ContextKind
+from presentation.exceptions import ExpiredAccessTokenError, InvalidAccessTokenError
+from presentation.handlers.chat_session import ChatSessionHandler
+from presentation.ws.connection import StarletteChatConnectionAdapter
+
+router = APIRouter()
+
+
+@router.websocket("/ws/chats/{context_kind}/{context_external_id}")
+@inject
+async def chat_session(
+    websocket: WebSocket,
+    context_kind: ContextKind,
+    context_external_id: str,
+    token: Annotated[str, Query()],
+    handler: FromDishka[ChatSessionHandler],
+) -> None:
+    try:
+        await handler(
+            token,
+            context_kind,
+            context_external_id,
+            StarletteChatConnectionAdapter(websocket),
+        )
+    except InvalidAccessTokenError as error:
+        await websocket.close(code=4401, reason=str(error))
+    except ExpiredAccessTokenError as error:
+        await websocket.close(code=4403, reason=str(error))
+    except ChatNotFoundError as error:
+        await websocket.close(code=4404, reason=str(error))
+    except (ChatMembershipForbiddenError, ActorNotFoundError) as error:
+        await websocket.close(code=4403, reason=str(error))
+    except WebSocketDisconnect:
+        return
+
+src/setup/__init__.py
+
+from .config import Settings, settings
+from .db_helper import DatabaseHelper
+
+src/setup/config.py
+
+from pathlib import Path
+
+from pydantic import BaseModel, KafkaDsn, PostgresDsn
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+BASE_DIR = Path(__file__).parent.parent
+
+
+class RunConfig(BaseModel):
+    host: str = "0.0.0.0"
+    port: int = 8009
+
+
+class TransportConfig(BaseModel):
+    kafka_url: KafkaDsn
+
+
+class DatabaseConfig(BaseModel):
+    url: PostgresDsn
+    echo: bool = False
+    echo_pool: bool = False
+    pool_size: int = 10
+    max_overflow: int = 10
+
+
+class ServiceConfig(BaseModel):
+    encryption_key: str
+
+
+class RedisConfig(BaseModel):
+    url: str = "redis://:chat@localhost:6382/0"
+
+
+class AuthConfig(BaseModel):
+    public_key_path: Path = BASE_DIR / "certificates" / "jwt-public.pem"
+    algorithm: str = "RS256"
+
+
+class ChatSessionConfig(BaseModel):
+    history_limit: int = 50
+    debounce_seconds: float = 5.0
+    periodic_seconds: float = 30.0
+    periodic_max_concurrency: int = 20
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=BASE_DIR / ".env_app",
+        case_sensitive=False,
+        env_nested_delimiter="__",
+        env_prefix="APP_CONFIG__",
+    )
+
+    run: RunConfig = RunConfig()
+    db: DatabaseConfig
+    transport: TransportConfig
+    service: ServiceConfig
+    redis: RedisConfig = RedisConfig()
+    auth: AuthConfig = AuthConfig()
+    chat_session: ChatSessionConfig = ChatSessionConfig()
+
+
+settings = Settings()
+
+src/setup/db_helper.py
+
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
+
+
+class DatabaseHelper:
+    def __init__(
+        self,
+        url: str,
+        echo: bool = False,
+        echo_pool: bool = False,
+        pool_size: int = 5,
+        max_overflow: int = 10,
+    ) -> None:
+        self.engine: AsyncEngine = create_async_engine(
+            url=url,
+            echo=echo,
+            echo_pool=echo_pool,
+            pool_size=pool_size,
+            max_overflow=max_overflow,
+        )
+        self.session_factory: async_sessionmaker[AsyncSession] = async_sessionmaker(
+            bind=self.engine,
+            expire_on_commit=False,
+            autoflush=False,
+            autocommit=False,
+        )
+
+    async def dispose(self) -> None:
+        await self.engine.dispose()
+
+src/setup/providers/__init__.py
+
+from .application_provider import ApplicationProvider
+from .database_provider import DatabaseProvider
+from .domain_provider import DomainProvider
+from .presentation_provider import PresentationProvider
+from .runtime_provider import RuntimeProvider
+
+src/setup/providers/application_provider.py
+
+from dishka import Provider, Scope, provide
+
+from application.compositions import (
+    AddProjectMemberComposition,
+    CreateActorComposition,
+    CreateChatComposition,
+    CreateProjectChatComposition,
+    FlushChatRoomMessagesComposition,
+    GetChatHistoryComposition,
+    JoinChatMembershipComposition,
+    RemoveChatMemberComposition,
+)
+from application.ports import Clock
+from application.ports.gateways import (
+    ActorCommandGateway,
+    ActorQueryGateway,
+    ChatCommandGateway,
+    ChatMembershipCommandGateway,
+    ChatMembershipQueryGateway,
+    ChatQueryGateway,
+    MessageCommandGateway,
+    MessageQueryGateway,
+)
+from application.usecases import (
+    AddChatMemberUsecase,
+    CreateActorUsecase,
+    CreateChatUsecase,
+    RemoveChatMemberUsecase,
+    CreateUserMessageUsecase,
+    CreateSystemMessageUsecase,
+    GetChatHistoryUsecase,
+    JoinChatRoomUsecase,
+    RequireChatAccessUsecase,
+    ServeChatConnectionUsecase,
+)
+from infrastructure.adapters import TimestampClock
+from infrastructure.adapters.gateways import (
+    SQLAlchemyActorCommandGateway,
+    SQLAlchemyActorQueryGateway,
+    SQLAlchemyChatCommandGateway,
+    SQLAlchemyChatMembershipCommandGateway,
+    SQLAlchemyChatMembershipQueryGateway,
+    SQLAlchemyChatQueryGateway,
+    SQLAlchemyMessageCommandGateway,
+)
+from infrastructure.adapters.mappers import SQLAlchemyChatMapper
+
+
+class ApplicationProvider(Provider):
+    scope = Scope.REQUEST
+
+    clock = provide(source=TimestampClock, provides=Clock, scope=Scope.APP)
+
+    chat_mapper = provide(SQLAlchemyChatMapper, scope=Scope.SESSION)
+
+    actor_command_gateway = provide(
+        source=SQLAlchemyActorCommandGateway,
+        provides=ActorCommandGateway,
+        scope=Scope.SESSION,
+    )
+    actor_query_gateway = provide(
+        source=SQLAlchemyActorQueryGateway,
+        provides=ActorQueryGateway,
+        scope=Scope.SESSION,
+    )
+    chat_command_gateway = provide(
+        source=SQLAlchemyChatCommandGateway,
+        provides=ChatCommandGateway,
+        scope=Scope.SESSION,
+    )
+    chat_membership_command_gateway = provide(
+        source=SQLAlchemyChatMembershipCommandGateway,
+        provides=ChatMembershipCommandGateway,
+        scope=Scope.SESSION,
+    )
+    chat_membership_query_gateway = provide(
+        source=SQLAlchemyChatMembershipQueryGateway,
+        provides=ChatMembershipQueryGateway,
+        scope=Scope.SESSION,
+    )
+    chat_query_gateway = provide(
+        source=SQLAlchemyChatQueryGateway,
+        provides=ChatQueryGateway,
+        scope=Scope.SESSION,
+    )
+    message_command_gateway = provide(
+        source=SQLAlchemyMessageCommandGateway,
+        provides=MessageCommandGateway,
+        scope=Scope.SESSION,
+    )
+    message_query_gateway = provide(
+        source=SQLAlchemyMessageCommandGateway,
+        provides=MessageQueryGateway,
+        scope=Scope.SESSION,
+    )
+
+    create_actor_usecase = provide(CreateActorUsecase)
+    create_chat_usecase = provide(CreateChatUsecase)
+    add_chat_member_usecase = provide(AddChatMemberUsecase)
+    remove_chat_member_usecase = provide(RemoveChatMemberUsecase)
+    create_system_message_usecase = provide(CreateSystemMessageUsecase)
+    create_user_message_usecase = provide(CreateUserMessageUsecase, scope=Scope.SESSION)
+    get_chat_history_usecase = provide(GetChatHistoryUsecase, scope=Scope.SESSION)
+    require_chat_access_usecase = provide(RequireChatAccessUsecase, scope=Scope.SESSION)
+    join_chat_room_usecase = provide(JoinChatRoomUsecase, scope=Scope.SESSION)
+    serve_chat_connection_usecase = provide(
+        ServeChatConnectionUsecase, scope=Scope.SESSION
+    )
+
+    create_actor_composition = provide(CreateActorComposition)
+    create_chat_composition = provide(CreateChatComposition)
+    create_project_chat_composition = provide(CreateProjectChatComposition)
+    add_project_member_composition = provide(AddProjectMemberComposition)
+    join_chat_membership_composition = provide(JoinChatMembershipComposition)
+    remove_chat_member_composition = provide(RemoveChatMemberComposition)
+    flush_chat_room_messages_composition = provide(
+        FlushChatRoomMessagesComposition, scope=Scope.SESSION
+    )
+    get_chat_history_composition = provide(GetChatHistoryComposition, scope=Scope.SESSION)
+
+src/setup/providers/database_provider.py
+
+from typing import AsyncGenerator
+
+from dishka import Provider, Scope, from_context, provide
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from application.ports import UnitOfWork
+from infrastructure.adapters import SQLAlchemyTransaction, UnitOfWorkImpl
+from setup.config import Settings
+from setup.db_helper import DatabaseHelper
+
+
+class DatabaseProvider(Provider):
+    scope = Scope.APP
+
+    settings = from_context(Settings)
+
+    @provide
+    def provide_db(self, settings: Settings) -> DatabaseHelper:
+        return DatabaseHelper(
+            url=str(settings.db.url),
+            echo=settings.db.echo,
+            echo_pool=settings.db.echo_pool,
+            pool_size=settings.db.pool_size,
+            max_overflow=settings.db.max_overflow,
+        )
+
+    unit_of_work = provide(
+        source=UnitOfWorkImpl,
+        provides=UnitOfWork,
+        scope=Scope.SESSION,
+    )
+
+    @provide(scope=Scope.SESSION)
+    async def provide_session(
+        self, db_helper: DatabaseHelper, unit_of_work: UnitOfWork
+    ) -> AsyncGenerator[AsyncSession, None]:
+        async with db_helper.session_factory() as session:
+            unit_of_work.add(SQLAlchemyTransaction(session))
+            yield session
+
+src/setup/providers/domain_provider.py
+
+from dishka import Provider, Scope, from_context, provide
+
+from domain.ports import MessageContentEncrypter
+from domain.services import ActorService, ChatService, MessageService
+from domain.value_objects import MessageEncryptionKey
+from infrastructure.adapters import (
+    FernetMessageContentEncrypter,
+    Uuid7ChatIdGenerator,
+)
+from setup.config import Settings
+
+
+class DomainProvider(Provider):
+    scope = Scope.APP
+
+    settings = from_context(Settings)
+
+    @provide
+    def provide_encryption_key(self, settings: Settings) -> MessageEncryptionKey:
+        return MessageEncryptionKey(settings.service.encryption_key)
+
+    message_content_encrypter = provide(
+        source=FernetMessageContentEncrypter,
+        provides=MessageContentEncrypter,
+    )
+
+    @provide
+    def provide_chat_service(self) -> ChatService:
+        return ChatService(id_generator=Uuid7ChatIdGenerator())
+
+    actor_service = provide(ActorService)
+    message_service = provide(MessageService)
+
+src/setup/providers/presentation_provider.py
+
+from dishka import Provider, Scope, from_context, provide
+
+from presentation.handlers import (
+    ChatHistoryHandler,
+    ChatSessionHandler,
+    JoinChatMembershipHandler,
+    LeaveChatMembershipHandler,
+)
+from presentation.presenters import CursorEncrypter, FernetCursorEncrypter
+from presentation.presenters.auth import JwtAccessTokenPresenter
+from setup.config import Settings
+
+
+class PresentationProvider(Provider):
+    scope = Scope.SESSION
+
+    settings = from_context(Settings, scope=Scope.APP)
+
+    @provide
+    def token_presenter(self, settings: Settings) -> JwtAccessTokenPresenter:
+        return JwtAccessTokenPresenter(
+            public_key=settings.auth.public_key_path.read_text(),
+            algorithm=settings.auth.algorithm,
+        )
+
+    @provide
+    def cursor_encrypter(self, settings: Settings) -> CursorEncrypter:
+        return FernetCursorEncrypter(settings.service.encryption_key)
+
+    chat_session_handler = provide(ChatSessionHandler)
+    chat_history_handler = provide(ChatHistoryHandler)
+    # These HTTP handlers depend on application-layer request-scoped compositions/usecases.
+    # Keep them request-scoped to satisfy Dishka scope validation.
+    join_chat_membership_handler = provide(JoinChatMembershipHandler, scope=Scope.REQUEST)
+    leave_chat_membership_handler = provide(LeaveChatMembershipHandler, scope=Scope.REQUEST)
+
+src/setup/providers/runtime_provider.py
+
+from dishka import Provider, Scope, from_context, provide
+from redis.asyncio import Redis
+
+from application.ports import (
+    Clock,
+    ChatRoomEventPublisher,
+    ChatRoomFactory,
+    ChatRoomRegistry,
+    ChatRuntimeStore,
+    ChatSessionSavePolicy,
+)
+from application.ports.gateways import DurableMessageCommandGateway
+from application.services import (
+    ChatRoomLifecycleHandler,
+    ChatRoomPresenceHandler,
+    ChatRoomSaver,
+)
+from setup.config import Settings
+
+from infrastructure.chat_session import (
+    InMemoryChatRoomRegistry,
+    InMemoryChatRoomEventPublisher,
+    LiveChatRoomFactory,
+    RedisChatMessageMapper,
+    RedisChatRuntimeStore,
+)
+from infrastructure.chat_session.save_policies import (
+    CompositeChatSessionSavePolicy,
+    DebounceChatSessionSavePolicy,
+    PeriodicChatSessionSavePolicy,
+)
+from infrastructure.adapters.gateways import SQLAlchemyDurableMessageCommandGateway
+
+
+class RuntimeProvider(Provider):
+    scope = Scope.APP
+
+    settings = from_context(Settings)
+
+    @provide
+    def redis_client(self, settings: Settings) -> Redis:
+        return Redis.from_url(settings.redis.url, decode_responses=True)
+
+    redis_message_mapper = provide(RedisChatMessageMapper)
+    runtime_store = provide(
+        source=RedisChatRuntimeStore,
+        provides=ChatRuntimeStore,
+    )
+    room_registry = provide(
+        source=InMemoryChatRoomRegistry,
+        provides=ChatRoomRegistry,
+    )
+    durable_message_commands = provide(
+        source=SQLAlchemyDurableMessageCommandGateway,
+        provides=DurableMessageCommandGateway,
+    )
+    room_saver = provide(ChatRoomSaver)
+    presence_handler = provide(ChatRoomPresenceHandler)
+
+    @provide
+    def save_policy(
+        self,
+        settings: Settings,
+        room_saver: ChatRoomSaver,
+        registry: ChatRoomRegistry,
+    ) -> ChatSessionSavePolicy:
+        return CompositeChatSessionSavePolicy(
+            [
+                DebounceChatSessionSavePolicy(
+                    room_saver=room_saver,
+                    delay=settings.chat_session.debounce_seconds,
+                ),
+                PeriodicChatSessionSavePolicy(
+                    room_saver=room_saver,
+                    registry=registry,
+                    interval=settings.chat_session.periodic_seconds,
+                    max_concurrent=settings.chat_session.periodic_max_concurrency,
+                ),
+            ]
+        )
+
+    @provide
+    def lifecycle_handler(
+        self,
+        registry: ChatRoomRegistry,
+        runtime_store: ChatRuntimeStore,
+        room_saver: ChatRoomSaver,
+        save_policy: ChatSessionSavePolicy,
+    ) -> ChatRoomLifecycleHandler:
+        return ChatRoomLifecycleHandler(
+            registry=registry,
+            runtime_store=runtime_store,
+            saver=room_saver,
+            save_policy=save_policy,
+        )
+
+    @provide
+    def event_publisher(
+        self,
+        lifecycle_handler: ChatRoomLifecycleHandler,
+        presence_handler: ChatRoomPresenceHandler,
+    ) -> ChatRoomEventPublisher:
+        publisher = InMemoryChatRoomEventPublisher()
+        publisher.subscribe(lifecycle_handler)
+        publisher.subscribe(presence_handler)
+        return publisher
+
+    @provide
+    def room_factory(
+        self,
+        runtime_store: ChatRuntimeStore,
+        clock: Clock,
+        event_publisher: ChatRoomEventPublisher,
+    ) -> ChatRoomFactory:
+        return LiveChatRoomFactory(
+            runtime_store=runtime_store,
+            clock=clock,
+            event_publisher=event_publisher,
+        )
+
+src/utils/__init__.py
+
+from .bytes_structs_converter import decode
+from .case_converter import camel_case_to_snake_case
+from .consumer_id_generator import generate_consumer_id
+from .datetime import ensure_utc_datetime
+from .merge_context import merge_context
+from .uuid7_generator import uuid7, extract_timestamp_from_uuid7
+
+src/utils/bytes_structs_converter.py
+
+__all__ = ["decode"]
+
+
+from typing import Callable, Sequence
+
+
+def decode[**P, T](query_command: Callable[P, T]) -> Callable[P, T]:
+
+    async def wrapper(
+        *args: P.args, **kwargs: P.kwargs
+    ) -> list[dict[str, str]] | dict[str, str]:
+        response: Sequence[dict[bytes, bytes]] = await query_command(*args, **kwargs)
+
+        result: list[dict[str, str]] = [
+            {k.decode(): v.decode() for k, v in raw.items()} for raw in response
+        ]
+        return result[0] if len(result) == 1 else result
+
+    return wrapper
+
+src/utils/case_converter.py
+
+def camel_case_to_snake_case(input_str: str) -> str:
+    """
+    >>> camel_case_to_snake_case("SomeSDK")
+    'some_sdk'
+    >>> camel_case_to_snake_case("RServoDrive")
+    'r_servo_drive'
+    >>> camel_case_to_snake_case("SDKDemo")
+    'sdk_demo'
+    """
+    chars = []
+    for c_idx, char in enumerate(input_str):
+        if c_idx and char.isupper():
+            nxt_idx = c_idx + 1
+            # idea of the flag is to separate abbreviations
+            # as new words, show them in lower case
+            flag = nxt_idx >= len(input_str) or input_str[nxt_idx].isupper()
+            prev_char = input_str[c_idx - 1]
+            if prev_char.isupper() and flag:
+                pass
+            else:
+                chars.append("_")
+        chars.append(char.lower())
+    return "".join(chars)
+
+src/utils/consumer_id_generator.py
+
+import socket
+import uuid
+import os
+
+def generate_consumer_id() -> str:
+    return f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:6]}"
+
+src/utils/datetime.py
+
+from datetime import UTC, datetime
+
+
+def ensure_utc_datetime(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+src/utils/merge_context.py
+
+__all__ = ["merge_context"]
+
+from typing import Type
+from dishka.async_container import CONTAINER_KEY
+from dishka import DependencyKey, AsyncContainer, DEFAULT_COMPONENT
+
+def _to_dependency_key(type_hint: Type):
+    return DependencyKey(type_hint, DEFAULT_COMPONENT)
+
+def merge_context(prev_container: AsyncContainer, extra_context: dict[DependencyKey, object | Type]) -> dict[DependencyKey, object | Type]:
+    merged: dict[DependencyKey, object | Type] = {}
+
+    for key, val in getattr(prev_container, "_context", {}).items():
+        if key is CONTAINER_KEY:
+            continue
+        
+        if isinstance(key, DependencyKey):
+            merged[key] = val
+        else:
+            merged[_to_dependency_key(key)] = val
+
+    for k, v in extra_context.items():
+        dk = _to_dependency_key(k)
+        merged[dk] = v
+
+    return merged
+
+src/utils/uuid7_generator.py
+
+from uuid import UUID
+
+_last_v7_timestamp = None
+
+def uuid7():
+    """The UUIDv7 format is designed to encode a Unix timestamp with
+    arbitrary sub-second precision.  The key property provided by UUIDv7
+    is that timestamp values generated by one system and parsed by
+    another are guaranteed to have sub-second precision of either the
+    generator or the parser, whichever is less.  Additionally, the system
+    parsing the UUIDv7 value does not need to know which precision was
+    used during encoding in order to function correctly."""
+
+    global _last_v7_timestamp
+    import random
+    import time
+
+    nanoseconds = time.time_ns()
+    if _last_v7_timestamp is not None and nanoseconds <= _last_v7_timestamp:
+        nanoseconds = _last_v7_timestamp + 1
+    _last_v7_timestamp = nanoseconds
+    timestamp_s, timestamp_ns = divmod(nanoseconds, 10**9)
+    subsec_a = timestamp_ns >> 18
+    subsec_b = (timestamp_ns >> 6) & 0x0FFF
+    subsec_seq_node = (timestamp_ns & 0x3F) << 56
+    subsec_seq_node += random.SystemRandom().getrandbits(56)
+    uuid_int = (timestamp_s & 0x0FFFFFFFFF) << 92
+    uuid_int += subsec_a << 80
+    uuid_int += subsec_b << 64
+    uuid_int += subsec_seq_node
+    return UUID(int=uuid_int)
+
+def extract_timestamp_from_uuid7(uuid_obj):
+    """Extract timestamp from UUIDv7 object"""
+    uuid_int = uuid_obj.int
+    
+    # Extract components according to UUIDv7 structure
+    timestamp_s = (uuid_int >> 92) & 0x0FFFFFFFFF  # 36 bits for seconds
+    subsec_a = (uuid_int >> 80) & 0x0FFF           # 12 bits
+    subsec_b = (uuid_int >> 64) & 0x0FFF           # 12 bits
+    subsec_c = (uuid_int >> 56) & 0x3F             # 6 bits
+    
+    # Reconstruct nanoseconds
+    timestamp_ns = (subsec_a << 18) | (subsec_b << 6) | subsec_c
+    
+    # Calculate total nanoseconds
+    total_ns = timestamp_s * 10**9 + timestamp_ns
+    
+    return total_ns

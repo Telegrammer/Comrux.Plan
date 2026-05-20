@@ -14,3 +14,14 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+
+  redis:
+    image: redis:7
+    command: ["redis-server", "--requirepass", "chat"]
+    ports:
+      - "6382:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "chat", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5

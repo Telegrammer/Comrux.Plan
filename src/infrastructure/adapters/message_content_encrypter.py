@@ -9,3 +9,6 @@ class FernetMessageContentEncrypter:
 
     def __call__(self, content: str) -> bytes:
         return self._fernet.encrypt(content.encode("utf-8"))
+
+    def decrypt(self, content: bytes) -> str:
+        return self._fernet.decrypt(content).decode("utf-8")

@@ -1,0 +1,1720 @@
+tests/application/test_actor_membership_flow.py
+
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from uuid import UUID
+
+import pytest
+
+from application.compositions.add_project_member import (
+    AddProjectMemberComposition,
+    AddProjectMemberRequest,
+)
+from application.compositions.remove_chat_member import (
+    RemoveChatMemberComposition,
+    RemoveChatMemberCompositionRequest,
+)
+from application.compositions.create_project_chat import (
+    CreateProjectChatComposition,
+    CreateProjectChatRequest,
+)
+from application.ports import ChatMessage, ChatRoom, ChatRoomRegistry, Clock
+from application.ports.gateways import (
+    ActorCommandGateway,
+    ActorQueryGateway,
+    ChatCommandGateway,
+    ChatMembershipCommandGateway,
+    ChatMembershipQueryGateway,
+    ChatQueryGateway,
+    MessageCommandGateway,
+)
+from application.usecases import (
+    AddChatMemberUsecase,
+    CreateActorRequest,
+    CreateActorUsecase,
+    CreateChatRequest,
+    CreateChatUsecase,
+    RemoveChatMemberRequest,
+    RemoveChatMemberUsecase,
+    CreateSystemMessageUsecase,
+)
+from domain.entities.actor import Actor, ActorId
+from domain.entities.chat import Chat, ChatId, ChatMembership, ContextKind, ContextRef
+from domain.entities.message import Message
+from domain.services import ActorService, ChatService, MessageService
+from infrastructure.adapters.unit_of_work import UnitOfWorkImpl
+
+
+class FixedClock(Clock):
+    def __init__(self, now_value: datetime) -> None:
+        self._now_value = now_value
+
+    def now(self) -> datetime:
+        return self._now_value
+
+
+class InMemoryActorGateway(ActorCommandGateway, ActorQueryGateway):
+    def __init__(self, existing_actors: list[Actor] | None = None) -> None:
+        self.saved_actors: list[Actor] = []
+        self._actors_by_id: dict[ActorId, Actor] = {}
+        for actor in existing_actors or []:
+            self._actors_by_id[actor.id] = actor
+
+    async def add(self, actor: Actor) -> None:
+        self.saved_actors.append(actor)
+        self._actors_by_id[actor.id] = actor
+
+    async def by_id(self, actor_id: ActorId) -> Actor | None:
+        return self._actors_by_id.get(actor_id)
+
+
+class InMemoryChatGateway(ChatCommandGateway, ChatQueryGateway):
+    def __init__(self, existing_chat: Chat | None = None) -> None:
+        self.saved_chats: list[Chat] = []
+        self._chat_by_context: dict[tuple[str, str], Chat] = {}
+        if existing_chat is not None:
+            self._chat_by_context[
+                (existing_chat.context.kind.value, existing_chat.context.external_id)
+            ] = existing_chat
+
+    async def add(self, chat: Chat) -> None:
+        self.saved_chats.append(chat)
+        self._chat_by_context[(chat.context.kind.value, chat.context.external_id)] = chat
+
+    async def by_context(self, context: ContextRef) -> Chat | None:
+        return self._chat_by_context.get((context.kind.value, context.external_id))
+
+
+class InMemoryMembershipGateway(
+    ChatMembershipCommandGateway, ChatMembershipQueryGateway
+):
+    def __init__(self, existing_memberships: list[ChatMembership] | None = None) -> None:
+        self.saved_memberships: list[ChatMembership] = []
+        self.deleted_memberships: list[tuple[ChatId, ActorId]] = []
+        self._memberships: dict[tuple[ChatId, ActorId], ChatMembership] = {}
+        for membership in existing_memberships or []:
+            self._memberships[(membership.chat, membership.actor)] = membership
+
+    async def add(self, membership: ChatMembership) -> None:
+        self.saved_memberships.append(membership)
+        self._memberships[(membership.chat, membership.actor)] = membership
+
+    async def by_chat_and_actor(
+        self, chat_id: ChatId, actor_id: ActorId
+    ) -> ChatMembership | None:
+        return self._memberships.get((chat_id, actor_id))
+
+    async def remove(self, chat_id: ChatId, actor_id: ActorId) -> None:
+        self.deleted_memberships.append((chat_id, actor_id))
+        self._memberships.pop((chat_id, actor_id), None)
+
+
+class InMemoryMessageGateway(MessageCommandGateway):
+    def __init__(self) -> None:
+        self.saved_messages: list[Message] = []
+
+    async def add(self, message: Message) -> None:
+        self.saved_messages.append(message)
+
+
+@dataclass(frozen=True)
+class FlowScenario:
+    actor_gateway: InMemoryActorGateway
+    chat_gateway: InMemoryChatGateway
+    membership_gateway: InMemoryMembershipGateway
+    message_gateway: InMemoryMessageGateway
+    create_actor_usecase: CreateActorUsecase
+    create_project_chat: CreateProjectChatComposition
+    add_project_member: AddProjectMemberComposition
+    remove_chat_member_usecase: RemoveChatMemberUsecase
+    create_system_message_usecase: CreateSystemMessageUsecase
+
+
+def build_actor(actor_id: str, display_name: str, *, email: str) -> Actor:
+    return ActorService().create_actor(
+        actor_id=ActorId(UUID(actor_id)),
+        display_name=display_name,
+        public_id=email,
+    )
+
+
+def build_flow_scenario(
+    *,
+    existing_actors: list[Actor] | None = None,
+    existing_chat: Chat | None = None,
+    existing_memberships: list[ChatMembership] | None = None,
+) -> FlowScenario:
+    actor_gateway = InMemoryActorGateway(existing_actors=existing_actors)
+    chat_gateway = InMemoryChatGateway(existing_chat=existing_chat)
+    membership_gateway = InMemoryMembershipGateway(
+        existing_memberships=existing_memberships
+    )
+    message_gateway = InMemoryMessageGateway()
+    fixed_clock = FixedClock(datetime(2026, 4, 12, tzinfo=UTC))
+
+    create_chat_usecase = CreateChatUsecase(
+        clock=fixed_clock,
+        chat_queries=chat_gateway,
+        chat_commands=chat_gateway,
+        chat_service=ChatService(
+            id_generator=lambda: ChatId(UUID("11111111-1111-1111-1111-111111111111"))
+        ),
+    )
+    add_chat_member_usecase = AddChatMemberUsecase(
+        clock=fixed_clock,
+        actor_queries=actor_gateway,
+        membership_queries=membership_gateway,
+        membership_commands=membership_gateway,
+        chat_service=ChatService(
+            id_generator=lambda: ChatId(UUID("11111111-1111-1111-1111-111111111111"))
+        ),
+    )
+    create_system_message_usecase = CreateSystemMessageUsecase(
+        clock=fixed_clock,
+        message_commands=message_gateway,
+        message_service=MessageService(
+            encrypter=lambda value: f"enc:{value}".encode("utf-8")
+        ),
+    )
+    remove_chat_member_usecase = RemoveChatMemberUsecase(
+        actor_queries=actor_gateway,
+        membership_queries=membership_gateway,
+        membership_commands=membership_gateway,
+    )
+
+    return FlowScenario(
+        actor_gateway=actor_gateway,
+        chat_gateway=chat_gateway,
+        membership_gateway=membership_gateway,
+        message_gateway=message_gateway,
+        create_actor_usecase=CreateActorUsecase(
+            actor_queries=actor_gateway,
+            actor_commands=actor_gateway,
+            actor_service=ActorService(),
+        ),
+        create_project_chat=CreateProjectChatComposition(
+            create_chat=create_chat_usecase,
+            add_chat_member=add_chat_member_usecase,
+            create_system_message=create_system_message_usecase,
+            unit_of_work=UnitOfWorkImpl(),
+        ),
+        add_project_member=AddProjectMemberComposition(
+            create_chat=create_chat_usecase,
+            add_chat_member=add_chat_member_usecase,
+            create_system_message=create_system_message_usecase,
+            unit_of_work=UnitOfWorkImpl(),
+        ),
+        remove_chat_member_usecase=remove_chat_member_usecase,
+        create_system_message_usecase=create_system_message_usecase,
+    )
+
+
+class StubChatRoom(ChatRoom):
+    def __init__(self, chat_id: ChatId) -> None:
+        self._chat_id = chat_id
+        self.disconnected_actors: list[ActorId] = []
+        self._is_dirty = False
+        self._is_empty = True
+
+    @property
+    def chat_id(self) -> ChatId:
+        return self._chat_id
+
+    @property
+    def is_dirty(self) -> bool:
+        return self._is_dirty
+
+    @property
+    def is_empty(self) -> bool:
+        return self._is_empty
+
+    async def serve(self, actor: Actor, connection) -> None:
+        return None
+
+    async def pending_messages(self) -> list[ChatMessage]:
+        return []
+
+    async def mark_persisted(self, runtime_ids: list[str]) -> None:
+        return None
+
+    def mark_clean(self) -> None:
+        self._is_dirty = False
+
+    async def disconnect_actor(self, actor_id: ActorId) -> int:
+        self.disconnected_actors.append(actor_id)
+        return 1
+
+
+class StubChatRoomRegistry(ChatRoomRegistry):
+    def __init__(self, rooms: dict[ChatId, ChatRoom] | None = None) -> None:
+        self._rooms = rooms or {}
+
+    async def get(self, chat_id: ChatId) -> ChatRoom | None:
+        return self._rooms.get(chat_id)
+
+    async def register(self, chat_id: ChatId, room: ChatRoom) -> ChatRoom:
+        self._rooms[chat_id] = room
+        return room
+
+    async def remove(self, chat_id: ChatId) -> None:
+        self._rooms.pop(chat_id, None)
+
+    def get_all(self) -> dict[ChatId, ChatRoom]:
+        return dict(self._rooms)
+
+
+class StubChatRoomSaver:
+    def __init__(self) -> None:
+        self.saved_chat_ids: list[ChatId] = []
+
+    async def save_if_dirty(self, chat_id: ChatId) -> bool:
+        self.saved_chat_ids.append(chat_id)
+        return True
+
+
+@pytest.mark.asyncio
+async def test_create_actor_usecase_creates_actor_once() -> None:
+    scenario = build_flow_scenario()
+    request = CreateActorRequest.from_primitives(
+        actor_id="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        display_name="Alice",
+        email="alice@example.com",
+    )
+
+    response = await scenario.create_actor_usecase(request)
+
+    assert response.was_created is True
+    assert len(scenario.actor_gateway.saved_actors) == 1
+    assert scenario.actor_gateway.saved_actors[0].public_id == "alice@example.com"
+
+
+@pytest.mark.asyncio
+async def test_create_project_chat_adds_owner_and_chat_created_message() -> None:
+    owner = build_actor(
+        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        "Alice",
+        email="alice@example.com",
+    )
+    scenario = build_flow_scenario(existing_actors=[owner])
+    request = CreateProjectChatRequest(
+        chat=CreateChatRequest.from_primitives(
+            name=None,
+            context_kind=ContextKind.PROJECT,
+            ref="project-1",
+        ),
+        owner_id=owner.id,
+    )
+
+    response = await scenario.create_project_chat(request)
+
+    assert response.chat_was_created is True
+    assert response.owner_was_added is True
+    assert len(scenario.chat_gateway.saved_chats) == 1
+    assert len(scenario.membership_gateway.saved_memberships) == 1
+    assert [message.content for message in scenario.message_gateway.saved_messages] == [
+        b"enc:Chat created"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_add_project_member_creates_missing_chat_and_member_message() -> None:
+    member = build_actor(
+        "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+        "Bob",
+        email="bob@example.com",
+    )
+    scenario = build_flow_scenario(existing_actors=[member])
+    request = AddProjectMemberRequest(
+        chat=CreateChatRequest.from_primitives(
+            name=None,
+            context_kind=ContextKind.PROJECT,
+            ref="project-2",
+        ),
+        actor_id=member.id,
+    )
+
+    response = await scenario.add_project_member(request)
+
+    assert response.chat_was_created is True
+    assert response.member_was_added is True
+    assert len(scenario.chat_gateway.saved_chats) == 1
+    assert len(scenario.membership_gateway.saved_memberships) == 1
+    assert [message.content for message in scenario.message_gateway.saved_messages] == [
+        b"enc:Chat created",
+        b"enc:Member added: public_id=bob@example.com, display_name=Bob",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_add_project_member_is_idempotent_for_existing_membership() -> None:
+    member = build_actor(
+        "cccccccc-cccc-cccc-cccc-cccccccccccc",
+        "Carol",
+        email="carol@example.com",
+    )
+    existing_chat = Chat(
+        id=ChatId(UUID("dddddddd-dddd-dddd-dddd-dddddddddddd")),
+        name=None,
+        context=ContextRef(kind=ContextKind.PROJECT, external_id="project-3"),
+        created_at=datetime(2026, 4, 10, tzinfo=UTC),
+        updated_at=datetime(2026, 4, 10, tzinfo=UTC),
+        members=[],
+    )
+    existing_membership = ChatMembership(
+        chat=existing_chat.id,
+        actor=member.id,
+        joined_at=datetime(2026, 4, 10, tzinfo=UTC),
+    )
+    scenario = build_flow_scenario(
+        existing_actors=[member],
+        existing_chat=existing_chat,
+        existing_memberships=[existing_membership],
+    )
+    request = AddProjectMemberRequest(
+        chat=CreateChatRequest.from_primitives(
+            name=None,
+            context_kind=ContextKind.PROJECT,
+            ref="project-3",
+        ),
+        actor_id=member.id,
+    )
+
+    response = await scenario.add_project_member(request)
+
+    assert response.chat_was_created is False
+    assert response.member_was_added is False
+    assert scenario.chat_gateway.saved_chats == []
+    assert scenario.membership_gateway.saved_memberships == []
+    assert scenario.message_gateway.saved_messages == []
+
+
+@pytest.mark.asyncio
+async def test_remove_chat_member_usecase_returns_identity_and_is_idempotent() -> None:
+    member = build_actor(
+        "dddddddd-dddd-dddd-dddd-dddddddddddd",
+        "Diana",
+        email="diana@example.com",
+    )
+    chat_id = ChatId(UUID("eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"))
+    membership = ChatMembership(
+        chat=chat_id,
+        actor=member.id,
+        joined_at=datetime(2026, 4, 10, tzinfo=UTC),
+    )
+    scenario = build_flow_scenario(
+        existing_actors=[member],
+        existing_memberships=[membership],
+    )
+    request = RemoveChatMemberRequest(chat_id=chat_id, actor_id=member.id)
+
+    first_response = await scenario.remove_chat_member_usecase(request)
+    second_response = await scenario.remove_chat_member_usecase(request)
+
+    assert first_response.was_removed is True
+    assert first_response.display_name == "Diana"
+    assert first_response.public_id == "diana@example.com"
+    assert first_response.name == "Diana"
+    assert second_response.was_removed is False
+    assert scenario.membership_gateway.deleted_memberships == [(chat_id, member.id)]
+
+
+@pytest.mark.asyncio
+async def test_remove_chat_member_composition_creates_system_message_and_disconnects() -> None:
+    member = build_actor(
+        "ffffffff-ffff-ffff-ffff-ffffffffffff",
+        "Frank",
+        email="frank@example.com",
+    )
+    chat = Chat(
+        id=ChatId(UUID("12121212-1212-1212-1212-121212121212")),
+        name=None,
+        context=ContextRef(kind=ContextKind.DOCUMENT, external_id="doc-123"),
+        created_at=datetime(2026, 4, 10, tzinfo=UTC),
+        updated_at=datetime(2026, 4, 10, tzinfo=UTC),
+        members=[],
+    )
+    membership = ChatMembership(
+        chat=chat.id,
+        actor=member.id,
+        joined_at=datetime(2026, 4, 10, tzinfo=UTC),
+    )
+    scenario = build_flow_scenario(
+        existing_actors=[member],
+        existing_chat=chat,
+        existing_memberships=[membership],
+    )
+    room = StubChatRoom(chat_id=chat.id)
+    room_registry = StubChatRoomRegistry(rooms={chat.id: room})
+    room_saver = StubChatRoomSaver()
+    composition = RemoveChatMemberComposition(
+        chat_queries=scenario.chat_gateway,
+        remove_chat_member=scenario.remove_chat_member_usecase,
+        create_system_message=scenario.create_system_message_usecase,
+        room_saver=room_saver,
+        room_registry=room_registry,
+        unit_of_work=UnitOfWorkImpl(),
+    )
+
+    response = await composition(
+        RemoveChatMemberCompositionRequest(context=chat.context, actor_id=member.id)
+    )
+
+    assert response.member_was_removed is True
+    assert response.display_name == "Frank"
+    assert room_saver.saved_chat_ids == [chat.id]
+    assert room.disconnected_actors == [member.id]
+    assert [message.content for message in scenario.message_gateway.saved_messages] == [
+        b"enc:Member left: name=Frank, public_id=frank@example.com, display_name=Frank"
+    ]
+
+tests/application/test_chat_session_usecases.py
+
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from uuid import UUID
+
+import pytest
+
+from application.exceptions import ChatMembershipForbiddenError, ChatNotFoundError
+from application.ports import ChatMessage, ChatRoom, ChatRoomFactory, ChatRoomRegistry, ChatRuntimeStore
+from application.ports.gateways import MessageQueryGateway
+from application.usecases.chat.join_chat_room import JoinChatRoomRequest, JoinChatRoomUsecase
+from application.usecases.chat.require_chat_access import (
+    RequireChatAccessRequest,
+    RequireChatAccessUsecase,
+)
+from application.usecases.message.get_chat_history import (
+    GetChatHistoryRequest,
+    GetChatHistoryUsecase,
+)
+from domain.entities.actor import Actor, ActorId
+from domain.entities.chat import Chat, ChatId, ChatMembership, ContextKind, ContextRef
+from domain.entities.message import MessageAuthorKind, MessageId
+from domain.value_objects import Name
+
+
+class InMemoryActorGateway:
+    def __init__(self, existing_actors: list[Actor] | None = None) -> None:
+        self._actors_by_id = {actor.id: actor for actor in existing_actors or []}
+
+    async def by_id(self, actor_id: ActorId) -> Actor | None:
+        return self._actors_by_id.get(actor_id)
+
+
+class InMemoryChatGateway:
+    def __init__(self, existing_chat: Chat | None = None) -> None:
+        self._chat_by_id: dict[ChatId, Chat] = {}
+        self._chat_by_context: dict[tuple[str, str], Chat] = {}
+        if existing_chat is not None:
+            self._chat_by_id[existing_chat.id] = existing_chat
+            self._chat_by_context[
+                (existing_chat.context.kind.value, existing_chat.context.external_id)
+            ] = existing_chat
+
+    async def by_context(self, context: ContextRef) -> Chat | None:
+        return self._chat_by_context.get((context.kind.value, context.external_id))
+
+    async def by_id(self, chat_id: ChatId) -> Chat | None:
+        return self._chat_by_id.get(chat_id)
+
+
+class InMemoryMembershipGateway:
+    def __init__(self, existing_memberships: list[ChatMembership] | None = None) -> None:
+        self._memberships: dict[tuple[ChatId, ActorId], ChatMembership] = {}
+        for membership in existing_memberships or []:
+            self._memberships[(membership.chat, membership.actor)] = membership
+
+    async def by_chat_and_actor(
+        self, chat_id: ChatId, actor_id: ActorId
+    ) -> ChatMembership | None:
+        return self._memberships.get((chat_id, actor_id))
+
+
+class StubMessageQueryGateway(MessageQueryGateway):
+    def __init__(self, messages: list[ChatMessage]) -> None:
+        self._messages = messages
+
+    async def recent_by_chat(
+        self,
+        chat_id: ChatId,
+        limit: int,
+        before_created_at: datetime | None = None,
+        before_message_id: int | None = None,
+    ) -> list[ChatMessage]:
+        messages = [message for message in self._messages if message.chat_id == chat_id]
+        messages.sort(
+            key=lambda message: (
+                message.created_at,
+                message.message_id.value if message.message_id is not None else 0,
+            )
+        )
+        if before_created_at is not None and before_message_id is not None:
+            messages = [
+                message
+                for message in messages
+                if (
+                    message.created_at < before_created_at
+                    or (
+                        message.created_at == before_created_at
+                        and message.message_id is not None
+                        and message.message_id.value < before_message_id
+                    )
+                )
+            ]
+        return messages[-limit:]
+
+
+class StubRuntimeStore(ChatRuntimeStore):
+    def __init__(self, pending_messages: list[ChatMessage] | None = None) -> None:
+        self._pending_messages = pending_messages or []
+
+    async def append_pending_message(self, message: ChatMessage) -> None:
+        self._pending_messages.append(message)
+
+    async def list_pending_messages(self, chat_id: ChatId) -> list[ChatMessage]:
+        return [message for message in self._pending_messages if message.chat_id == chat_id]
+
+    async def delete_pending_messages(self, chat_id: ChatId, runtime_ids: list[str]) -> None:
+        self._pending_messages = [
+            message
+            for message in self._pending_messages
+            if message.chat_id != chat_id or message.runtime_id not in runtime_ids
+        ]
+
+    async def add_active_member(self, chat_id: ChatId, actor_id: ActorId) -> None:
+        return None
+
+    async def remove_active_member(self, chat_id: ChatId, actor_id: ActorId) -> None:
+        return None
+
+    async def clear_room(self, chat_id: ChatId) -> None:
+        self._pending_messages = [
+            message for message in self._pending_messages if message.chat_id != chat_id
+        ]
+
+
+@dataclass
+class StubChatRoom:
+    chat_id: ChatId
+    is_dirty: bool = False
+    is_empty: bool = True
+
+    async def serve(self, actor: Actor, connection) -> None:
+        return None
+
+    async def pending_messages(self) -> list[ChatMessage]:
+        return []
+
+    async def mark_persisted(self, runtime_ids: list[str]) -> None:
+        return None
+
+    def mark_clean(self) -> None:
+        self.is_dirty = False
+
+    async def disconnect_actor(self, actor_id: ActorId) -> int:
+        return 0
+
+
+class StubChatRoomFactory(ChatRoomFactory):
+    def create(self, chat_id: ChatId) -> ChatRoom:
+        return StubChatRoom(chat_id=chat_id)
+
+
+class StubChatRoomRegistry(ChatRoomRegistry):
+    def __init__(self) -> None:
+        self._rooms: dict[ChatId, ChatRoom] = {}
+
+    async def get(self, chat_id: ChatId) -> ChatRoom | None:
+        return self._rooms.get(chat_id)
+
+    async def register(self, chat_id: ChatId, room: ChatRoom) -> ChatRoom:
+        self._rooms.setdefault(chat_id, room)
+        return self._rooms[chat_id]
+
+    async def remove(self, chat_id: ChatId) -> None:
+        self._rooms.pop(chat_id, None)
+
+    def get_all(self) -> dict[ChatId, ChatRoom]:
+        return dict(self._rooms)
+
+
+def build_actor(actor_id: str, display_name: str) -> Actor:
+    return Actor(
+        id=ActorId(UUID(actor_id)),
+        display_name=Name(display_name),
+        public_id=f"{display_name.lower()}@example.com",
+    )
+
+
+def build_chat(chat_id: str) -> Chat:
+    return Chat(
+        id=ChatId(UUID(chat_id)),
+        name=None,
+        context=ContextRef(kind=ContextKind.PROJECT, external_id="project-1"),
+        created_at=datetime(2026, 4, 12, tzinfo=UTC),
+        updated_at=datetime(2026, 4, 12, tzinfo=UTC),
+        members=[],
+    )
+
+
+@pytest.mark.asyncio
+async def test_require_chat_access_rejects_non_member() -> None:
+    actor = build_actor("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "Alice")
+    chat = build_chat("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+    usecase = RequireChatAccessUsecase(
+        actor_queries=InMemoryActorGateway(existing_actors=[actor]),
+        chat_queries=InMemoryChatGateway(existing_chat=chat),
+        membership_queries=InMemoryMembershipGateway(),
+    )
+
+    with pytest.raises(ChatMembershipForbiddenError):
+        await usecase(
+            RequireChatAccessRequest(
+                chat_id=chat.id,
+                actor_id=actor.id,
+            )
+        )
+
+
+@pytest.mark.asyncio
+async def test_require_chat_access_rejects_missing_chat() -> None:
+    actor = build_actor("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "Alice")
+    usecase = RequireChatAccessUsecase(
+        actor_queries=InMemoryActorGateway(existing_actors=[actor]),
+        chat_queries=InMemoryChatGateway(),
+        membership_queries=InMemoryMembershipGateway(),
+    )
+
+    with pytest.raises(ChatNotFoundError):
+        await usecase(
+            RequireChatAccessRequest(
+                chat_id=ChatId(UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")),
+                actor_id=actor.id,
+            )
+        )
+
+
+@pytest.mark.asyncio
+async def test_get_chat_history_merges_persisted_and_pending_messages() -> None:
+    chat_id = ChatId(UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"))
+    actor_id = ActorId(UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"))
+    usecase = GetChatHistoryUsecase(
+        message_queries=StubMessageQueryGateway(
+            [
+                ChatMessage(
+                    chat_id=chat_id,
+                    content="persisted",
+                    created_at=datetime(2026, 4, 12, 10, 0, tzinfo=UTC),
+                    author_kind=MessageAuthorKind.USER,
+                    message_id=MessageId(1),
+                    author_id=actor_id,
+                    author_display_name="Alice",
+                    persisted=True,
+                )
+            ]
+        ),
+        runtime_store=StubRuntimeStore(
+            [
+                ChatMessage(
+                    chat_id=chat_id,
+                    content="pending",
+                    created_at=datetime(2026, 4, 12, 10, 1, tzinfo=UTC),
+                    author_kind=MessageAuthorKind.USER,
+                    runtime_id="runtime-1",
+                    author_id=actor_id,
+                    author_display_name="Alice",
+                    persisted=False,
+                )
+            ]
+        ),
+    )
+
+    response = await usecase(GetChatHistoryRequest(chat_id=chat_id, limit=10))
+
+    assert [message.content for message in response.messages] == ["persisted", "pending"]
+    assert [message.persisted for message in response.messages] == [True, False]
+    assert response.has_more is False
+    assert response.next_before_created_at is None
+    assert response.next_before_message_id is None
+
+
+@pytest.mark.asyncio
+async def test_get_chat_history_with_cursor_excludes_pending_messages() -> None:
+    chat_id = ChatId(UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"))
+    actor_id = ActorId(UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"))
+    usecase = GetChatHistoryUsecase(
+        message_queries=StubMessageQueryGateway(
+            [
+                ChatMessage(
+                    chat_id=chat_id,
+                    content=f"persisted-{index}",
+                    created_at=datetime(2026, 4, 12, 10, index, tzinfo=UTC),
+                    author_kind=MessageAuthorKind.USER,
+                    message_id=MessageId(index),
+                    author_id=actor_id,
+                    author_display_name="Alice",
+                    persisted=True,
+                )
+                for index in range(1, 6)
+            ]
+        ),
+        runtime_store=StubRuntimeStore(
+            [
+                ChatMessage(
+                    chat_id=chat_id,
+                    content="pending",
+                    created_at=datetime(2026, 4, 12, 11, 0, tzinfo=UTC),
+                    author_kind=MessageAuthorKind.USER,
+                    runtime_id="runtime-1",
+                    author_id=actor_id,
+                    author_display_name="Alice",
+                    persisted=False,
+                )
+            ]
+        ),
+    )
+
+    response = await usecase(
+        GetChatHistoryRequest(
+            chat_id=chat_id,
+            limit=2,
+            before_created_at=datetime(2026, 4, 12, 10, 5, tzinfo=UTC),
+            before_message_id=5,
+        )
+    )
+
+    assert [message.content for message in response.messages] == [
+        "persisted-3",
+        "persisted-4",
+    ]
+    assert all(message.persisted for message in response.messages)
+    assert response.has_more is True
+    assert response.next_before_message_id == 3
+    assert response.next_before_created_at == datetime(2026, 4, 12, 10, 3, tzinfo=UTC)
+
+
+@pytest.mark.asyncio
+async def test_join_chat_room_returns_existing_room_and_history() -> None:
+    actor = build_actor("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "Alice")
+    chat = build_chat("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+    membership = ChatMembership(
+        chat=chat.id,
+        actor=actor.id,
+        joined_at=datetime(2026, 4, 12, tzinfo=UTC),
+    )
+    registry = StubChatRoomRegistry()
+    existing_room = StubChatRoom(chat_id=chat.id)
+    await registry.register(chat.id, existing_room)
+    usecase = JoinChatRoomUsecase(
+        chat_queries=InMemoryChatGateway(existing_chat=chat),
+        access_usecase=RequireChatAccessUsecase(
+            actor_queries=InMemoryActorGateway(existing_actors=[actor]),
+            chat_queries=InMemoryChatGateway(existing_chat=chat),
+            membership_queries=InMemoryMembershipGateway(
+                existing_memberships=[membership]
+            ),
+        ),
+        history_usecase=GetChatHistoryUsecase(
+            message_queries=StubMessageQueryGateway([]),
+            runtime_store=StubRuntimeStore(),
+        ),
+        room_registry=registry,
+        room_factory=StubChatRoomFactory(),
+    )
+
+    response = await usecase(
+        JoinChatRoomRequest(
+            context=chat.context,
+            actor_id=actor.id,
+            history_limit=20,
+        )
+    )
+
+    assert response.room is existing_room
+    assert response.actor.id == actor.id
+    assert response.history == []
+
+tests/application/test_create_chat_composition.py
+
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from typing import Callable
+from uuid import UUID
+
+import pytest
+
+from application.compositions import CreateChatComposition
+from application.ports import Clock
+from application.ports.gateways import (
+    ChatCommandGateway,
+    ChatQueryGateway,
+    MessageCommandGateway,
+)
+from application.usecases import (
+    CreateChatRequest,
+    CreateChatUsecase,
+    CreateSystemMessageUsecase,
+)
+from domain.entities.chat import Chat, ChatId, ContextKind, ContextRef
+from domain.entities.message import Message, MessageAuthorKind
+from domain.services import ChatService, MessageService
+from infrastructure.adapters.unit_of_work import UnitOfWorkImpl
+
+
+class FixedClock(Clock):
+    def __init__(self, now_value: datetime) -> None:
+        self._now_value = now_value
+
+    def now(self) -> datetime:
+        return self._now_value
+
+
+class InMemoryChatGateway(ChatCommandGateway, ChatQueryGateway):
+    def __init__(self, existing_chat: Chat | None = None) -> None:
+        self.saved_chats: list[Chat] = []
+        self._chat_by_context: dict[tuple[str, str], Chat] = {}
+        if existing_chat is not None:
+            self._chat_by_context[
+                (existing_chat.context.kind.value, existing_chat.context.external_id)
+            ] = existing_chat
+
+    async def add(self, chat: Chat) -> None:
+        self.saved_chats.append(chat)
+        self._chat_by_context[(chat.context.kind.value, chat.context.external_id)] = chat
+
+    async def by_context(self, context: ContextRef) -> Chat | None:
+        return self._chat_by_context.get((context.kind.value, context.external_id))
+
+
+class InMemoryMessageGateway(MessageCommandGateway):
+    def __init__(self) -> None:
+        self.saved_messages: list[Message] = []
+
+    async def add(self, message: Message) -> None:
+        self.saved_messages.append(message)
+
+
+@dataclass(frozen=True)
+class Scenario:
+    composition: CreateChatComposition
+    chat_gateway: InMemoryChatGateway
+    message_gateway: InMemoryMessageGateway
+
+
+def build_scenario(
+    *,
+    existing_chat: Chat | None = None,
+    encrypted_message: Callable[[str], bytes] | None = None,
+) -> Scenario:
+    chat_gateway = InMemoryChatGateway(existing_chat=existing_chat)
+    message_gateway = InMemoryMessageGateway()
+    fixed_clock = FixedClock(datetime(2026, 4, 12, tzinfo=UTC))
+    chat_service = ChatService(
+        id_generator=lambda: ChatId(UUID("11111111-1111-1111-1111-111111111111"))
+    )
+    message_service = MessageService(
+        encrypter=encrypted_message or (lambda value: f"enc:{value}".encode("utf-8"))
+    )
+    create_chat_usecase = CreateChatUsecase(
+        clock=fixed_clock,
+        chat_queries=chat_gateway,
+        chat_commands=chat_gateway,
+        chat_service=chat_service,
+    )
+    create_system_message_usecase = CreateSystemMessageUsecase(
+        clock=fixed_clock,
+        message_commands=message_gateway,
+        message_service=message_service,
+    )
+    composition = CreateChatComposition(
+        create_chat=create_chat_usecase,
+        create_system_message=create_system_message_usecase,
+        unit_of_work=UnitOfWorkImpl(),
+    )
+    return Scenario(
+        composition=composition,
+        chat_gateway=chat_gateway,
+        message_gateway=message_gateway,
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_chat_composition_creates_chat_and_system_message() -> None:
+    scenario = build_scenario()
+    request = CreateChatRequest.from_primitives(
+        name=None,
+        context_kind=ContextKind.PROJECT,
+        ref="project-1",
+    )
+
+    response = await scenario.composition(request)
+
+    assert response.was_created is True
+    assert response.chat_id.value == UUID("11111111-1111-1111-1111-111111111111")
+    assert len(scenario.chat_gateway.saved_chats) == 1
+    assert len(scenario.message_gateway.saved_messages) == 1
+    assert scenario.message_gateway.saved_messages[0].author_kind is MessageAuthorKind.SYSTEM
+    assert scenario.message_gateway.saved_messages[0].content == b"enc:Chat created"
+
+
+@pytest.mark.asyncio
+async def test_create_chat_composition_is_idempotent_for_existing_context() -> None:
+    existing_chat = Chat(
+        id=ChatId(UUID("22222222-2222-2222-2222-222222222222")),
+        name=None,
+        context=ContextRef(kind=ContextKind.DOCUMENT, external_id="document-7"),
+        created_at=datetime(2026, 4, 10, tzinfo=UTC),
+        updated_at=datetime(2026, 4, 10, tzinfo=UTC),
+        members=[],
+    )
+    scenario = build_scenario(existing_chat=existing_chat)
+    request = CreateChatRequest.from_primitives(
+        name=None,
+        context_kind=ContextKind.DOCUMENT,
+        ref="document-7",
+    )
+
+    response = await scenario.composition(request)
+
+    assert response.was_created is False
+    assert response.chat_id == existing_chat.id
+    assert scenario.chat_gateway.saved_chats == []
+    assert scenario.message_gateway.saved_messages == []
+
+tests/application/test_flush_chat_room_messages.py
+
+from datetime import UTC, datetime
+from uuid import UUID
+
+import pytest
+
+from application.compositions import (
+    FlushChatRoomMessagesComposition,
+    FlushChatRoomMessagesRequest,
+)
+from application.ports import ChatMessage, Transaction, UnitOfWork
+from application.ports.gateways import MessageCommandGateway
+from domain.entities.actor import ActorId
+from domain.entities.chat import ChatId
+from domain.entities.message import Message, MessageAuthorKind
+from domain.services import MessageService
+
+
+class InMemoryMessageCommandGateway(MessageCommandGateway):
+    def __init__(self) -> None:
+        self.saved_messages: list[Message] = []
+
+    async def add(self, message: Message) -> None:
+        self.saved_messages.append(message)
+
+    async def add_many(self, messages: list[Message]) -> None:
+        self.saved_messages.extend(messages)
+
+
+class StubTransaction(Transaction):
+    def __init__(self) -> None:
+        self.completed = False
+        self.cancelled = False
+
+    async def complete(self) -> None:
+        self.completed = True
+
+    async def cancel(self) -> None:
+        self.cancelled = True
+
+
+class StubUnitOfWork(UnitOfWork):
+    def __init__(self) -> None:
+        self._transactions: list[Transaction] = [StubTransaction()]
+
+    def add(self, transaction: Transaction) -> None:
+        self._transactions.append(transaction)
+
+    async def __aenter__(self) -> "StubUnitOfWork":
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+        for transaction in self._transactions:
+            if exc_type is None:
+                await transaction.complete()
+            else:
+                await transaction.cancel()
+
+
+@pytest.mark.asyncio
+async def test_flush_chat_room_messages_persists_batch_and_returns_runtime_ids() -> None:
+    gateway = InMemoryMessageCommandGateway()
+    composition = FlushChatRoomMessagesComposition(
+        message_commands=gateway,
+        message_service=MessageService(
+            encrypter=lambda value: f"enc:{value}".encode("utf-8")
+        ),
+        unit_of_work=StubUnitOfWork(),
+    )
+
+    response = await composition(
+        FlushChatRoomMessagesRequest(
+            messages=[
+                ChatMessage(
+                    chat_id=ChatId(UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")),
+                    content="Hello",
+                    created_at=datetime(2026, 4, 12, tzinfo=UTC),
+                    author_kind=MessageAuthorKind.USER,
+                    runtime_id="runtime-1",
+                    author_id=ActorId(UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")),
+                    author_display_name="Alice",
+                )
+            ]
+        )
+    )
+
+    assert response.persisted_runtime_ids == ["runtime-1"]
+    assert len(gateway.saved_messages) == 1
+    assert gateway.saved_messages[0].author_kind is MessageAuthorKind.USER
+    assert gateway.saved_messages[0].content == b"enc:Hello"
+    assert gateway.saved_messages[0].runtime_id == "runtime-1"
+
+tests/conftest.py
+
+from pathlib import Path
+import sys
+
+SOURCE_DIRECTORY = Path(__file__).resolve().parent.parent / "src"
+if str(SOURCE_DIRECTORY) not in sys.path:
+    sys.path.insert(0, str(SOURCE_DIRECTORY))
+
+tests/domain/test_message_service.py
+
+from datetime import UTC, datetime
+from uuid import UUID
+
+from domain.entities.chat import ChatId
+from domain.entities.message import MessageAuthorKind, MessageId
+from domain.services import MessageService
+
+
+def test_message_service_creates_encrypted_system_message() -> None:
+    service = MessageService(encrypter=lambda value: f"encrypted:{value}".encode("utf-8"))
+
+    message = service.create_system_message(
+        content="Chat created",
+        chat_id=ChatId(UUID("33333333-3333-3333-3333-333333333333")),
+        now=datetime(2026, 4, 12, tzinfo=UTC),
+    )
+
+    assert message.id == MessageId(None)
+    assert message.author_kind is MessageAuthorKind.SYSTEM
+    assert message.author_id is None
+    assert message.content == b"encrypted:Chat created"
+
+tests/infrastructure/test_datetime_normalization.py
+
+from datetime import UTC, datetime
+from uuid import UUID
+
+from domain.entities.actor import ActorId
+from domain.entities.chat import ChatId
+from domain.entities.message import Message, MessageAuthorKind, MessageId
+from infrastructure.adapters.clock import TimestampClock
+from infrastructure.adapters.mappers import SQLAlchemyDomainMessageMapper
+from infrastructure.chat_session import RedisChatMessageDTO, RedisChatMessageMapper
+
+
+def test_sqlalchemy_domain_message_mapper_normalizes_naive_datetime_to_utc() -> None:
+    mapper = SQLAlchemyDomainMessageMapper()
+    domain_message = Message(
+        id=MessageId(None),
+        runtime_id="runtime-1",
+        chat_id=ChatId(UUID("11111111-1111-1111-1111-111111111111")),
+        content=b"encrypted",
+        created_at=datetime(2026, 4, 13, 18, 59, 15, 297120),
+        author_kind=MessageAuthorKind.USER,
+        author_id=ActorId(UUID("22222222-2222-2222-2222-222222222222")),
+    )
+
+    mapped_message = mapper.to_dto(domain_message)
+
+    assert mapped_message.created_at.tzinfo is UTC
+    assert mapped_message.created_at == datetime(
+        2026,
+        4,
+        13,
+        18,
+        59,
+        15,
+        297120,
+        tzinfo=UTC,
+    )
+
+
+def test_redis_chat_message_mapper_normalizes_naive_payload_datetime_to_utc() -> None:
+    mapper = RedisChatMessageMapper()
+    dto = RedisChatMessageDTO(
+        runtime_id="runtime-1",
+        chat_id="11111111-1111-1111-1111-111111111111",
+        author_id="22222222-2222-2222-2222-222222222222",
+        author_display_name="Alice",
+        content="Hello",
+        created_at="2026-04-13T18:59:15.297120",
+        author_kind=MessageAuthorKind.USER.value,
+    )
+
+    message = mapper.to_message(dto)
+
+    assert message.created_at.tzinfo is UTC
+    assert message.created_at == datetime(
+        2026,
+        4,
+        13,
+        18,
+        59,
+        15,
+        297120,
+        tzinfo=UTC,
+    )
+
+
+def test_timestamp_clock_returns_utc_aware_datetime() -> None:
+    clock = TimestampClock()
+
+    current_time = clock.now()
+
+    assert current_time.tzinfo is UTC
+    assert isinstance(current_time, datetime)
+
+tests/infrastructure/test_message_content_encrypter.py
+
+from infrastructure.adapters.message_content_encrypter import (
+    FernetMessageContentEncrypter,
+)
+from domain.value_objects import MessageEncryptionKey
+
+
+def test_fernet_message_content_encrypter_encrypts_plain_text() -> None:
+    encrypter = FernetMessageContentEncrypter(
+        MessageEncryptionKey("U6WgwxM_H0F1fvJzDYa0_Ac40mSZ8FGcqqb86QjYgHg=")
+    )
+
+    encrypted_content = encrypter("Chat created")
+
+    assert encrypted_content != b"Chat created"
+    assert encrypted_content.startswith(b"gAAAA")
+
+tests/infrastructure/test_message_gateway_pagination.py
+
+from datetime import UTC, datetime
+from uuid import UUID
+
+import pytest
+
+from domain.entities.chat import ChatId
+from infrastructure.adapters.gateways.message import SQLAlchemyMessageCommandGateway
+
+
+class _FakeCipher:
+    def decrypt(self, content: bytes) -> str:
+        return content.decode("utf-8")
+
+
+class _ScalarsResult:
+    def __init__(self, models: list[object]) -> None:
+        self._models = models
+
+    def all(self) -> list[object]:
+        return self._models
+
+
+class _CapturingSession:
+    def __init__(self) -> None:
+        self.stmt = None
+
+    async def scalars(self, stmt):
+        self.stmt = stmt
+        return _ScalarsResult([])
+
+
+@pytest.mark.asyncio
+async def test_recent_by_chat_uses_composite_cursor_filter() -> None:
+    session = _CapturingSession()
+    gateway = SQLAlchemyMessageCommandGateway(session=session, content_cipher=_FakeCipher())
+
+    await gateway.recent_by_chat(
+        chat_id=ChatId(UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")),
+        limit=20,
+        before_created_at=datetime(2026, 4, 12, 10, 30, tzinfo=UTC),
+        before_message_id=123,
+    )
+
+    assert session.stmt is not None
+    assert len(session.stmt._where_criteria) == 2
+    cursor_clause = str(session.stmt._where_criteria[1])
+    assert "messages.created_at <" in cursor_clause
+    assert "messages.created_at =" in cursor_clause
+    assert "messages.id <" in cursor_clause
+
+
+@pytest.mark.asyncio
+async def test_recent_by_chat_without_cursor_has_single_filter() -> None:
+    session = _CapturingSession()
+    gateway = SQLAlchemyMessageCommandGateway(session=session, content_cipher=_FakeCipher())
+
+    await gateway.recent_by_chat(
+        chat_id=ChatId(UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")),
+        limit=20,
+    )
+
+    assert session.stmt is not None
+    assert len(session.stmt._where_criteria) == 1
+
+tests/presentation/test_auth_presenter.py
+
+from datetime import UTC, datetime, timedelta
+
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+import jwt
+import pytest
+
+from presentation.exceptions import ExpiredAccessTokenError, InvalidAccessTokenError
+from presentation.presenters import JwtAccessTokenPresenter
+
+
+def build_keys() -> tuple[str, str]:
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    private_pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode("utf-8")
+    public_pem = private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    ).decode("utf-8")
+    return private_pem, public_pem
+
+
+def build_token(
+    private_key: str,
+    *,
+    token_type: str = "access",
+    expires_at: datetime | None = None,
+) -> str:
+    now = datetime.now(tz=UTC)
+    return jwt.encode(
+        {
+            "sub": "key-1",
+            "user_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            "iat": now.timestamp(),
+            "exp": (expires_at or (now + timedelta(minutes=5))).timestamp(),
+            "type": token_type,
+        },
+        private_key,
+        algorithm="RS256",
+    )
+
+
+def test_jwt_access_token_presenter_decodes_valid_access_token() -> None:
+    private_key, public_key = build_keys()
+    presenter = JwtAccessTokenPresenter(public_key=public_key, algorithm="RS256")
+
+    auth_info = presenter.present(build_token(private_key))
+
+    assert auth_info.key_id == "key-1"
+    assert auth_info.user_id == "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+
+
+def test_jwt_access_token_presenter_rejects_non_access_token() -> None:
+    private_key, public_key = build_keys()
+    presenter = JwtAccessTokenPresenter(public_key=public_key, algorithm="RS256")
+
+    with pytest.raises(InvalidAccessTokenError):
+        presenter.present(build_token(private_key, token_type="refresh"))
+
+
+def test_jwt_access_token_presenter_rejects_expired_token() -> None:
+    private_key, public_key = build_keys()
+    presenter = JwtAccessTokenPresenter(public_key=public_key, algorithm="RS256")
+
+    with pytest.raises(ExpiredAccessTokenError):
+        presenter.present(
+            build_token(
+                private_key,
+                expires_at=datetime.now(tz=UTC) - timedelta(minutes=1),
+            )
+        )
+
+tests/presentation/test_chat_history_handler.py
+
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from types import SimpleNamespace
+from uuid import UUID
+
+import pytest
+
+from application.compositions import GetChatHistoryCompositionResponse
+from application.ports import ChatMessage
+from domain.entities.actor import ActorId
+from domain.entities.chat import ChatId
+from domain.entities.message import MessageAuthorKind, MessageId
+from presentation.handlers import ChatHistoryHandler, GetChatHistoryPageRequest
+from presentation.models import ChatMessageEvent
+from presentation.presenters import AccessAuthInfo, ChatHistoryCursor
+
+
+class StubTokenPresenter:
+    def present(self, token: str) -> AccessAuthInfo:
+        return AccessAuthInfo(
+            key_id="key-1",
+            user_id="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        )
+
+
+@dataclass
+class StubCursorEncrypter:
+    decrypted: ChatHistoryCursor
+    encrypted: str
+    decrypt_calls: list[str]
+    encrypt_calls: list[ChatHistoryCursor]
+
+    def decrypt(self, token: str) -> ChatHistoryCursor:
+        self.decrypt_calls.append(token)
+        return self.decrypted
+
+    def encrypt(self, cursor: ChatHistoryCursor) -> str:
+        self.encrypt_calls.append(cursor)
+        return self.encrypted
+
+
+class StubComposition:
+    def __init__(self, response: GetChatHistoryCompositionResponse) -> None:
+        self.response = response
+        self.requests = []
+
+    async def __call__(self, request):
+        self.requests.append(request)
+        return self.response
+
+
+@pytest.mark.asyncio
+async def test_chat_history_handler_uses_cursor_and_builds_next_cursor() -> None:
+    chat_id = ChatId(UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"))
+    cursor_encrypter = StubCursorEncrypter(
+        decrypted=ChatHistoryCursor(
+            before_created_at=datetime(2026, 4, 12, 10, 30, tzinfo=UTC),
+            before_message_id=9,
+        ),
+        encrypted="cursor-next",
+        decrypt_calls=[],
+        encrypt_calls=[],
+    )
+    composition = StubComposition(
+        GetChatHistoryCompositionResponse(
+            messages=[
+                ChatMessage(
+                    chat_id=chat_id,
+                    content="hello",
+                    created_at=datetime(2026, 4, 12, 10, 0, tzinfo=UTC),
+                    author_kind=MessageAuthorKind.USER,
+                    message_id=MessageId(11),
+                    author_id=ActorId(UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")),
+                    author_display_name="Alice",
+                    persisted=True,
+                )
+            ],
+            has_more=True,
+            next_before_created_at=datetime(2026, 4, 12, 10, 0, tzinfo=UTC),
+            next_before_message_id=11,
+        )
+    )
+    handler = ChatHistoryHandler(
+        settings=SimpleNamespace(chat_session=SimpleNamespace(history_limit=50)),
+        token_presenter=StubTokenPresenter(),
+        cursor_encrypter=cursor_encrypter,
+        composition=composition,
+    )
+
+    response = await handler(
+        GetChatHistoryPageRequest(
+            token="token",
+            chat_id=str(chat_id.value),
+            limit=25,
+            cursor="cursor-current",
+        )
+    )
+
+    assert cursor_encrypter.decrypt_calls == ["cursor-current"]
+    assert composition.requests
+    assert composition.requests[0].before_message_id == 9
+    assert composition.requests[0].before_created_at == datetime(
+        2026, 4, 12, 10, 30, tzinfo=UTC
+    )
+    assert response.next_cursor == "cursor-next"
+    assert isinstance(response.messages[0], ChatMessageEvent)
+    assert cursor_encrypter.encrypt_calls == [
+        ChatHistoryCursor(
+            before_created_at=datetime(2026, 4, 12, 10, 0, tzinfo=UTC),
+            before_message_id=11,
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_chat_history_handler_clamps_limit_to_settings_value() -> None:
+    chat_id = ChatId(UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"))
+    composition = StubComposition(
+        GetChatHistoryCompositionResponse(
+            messages=[],
+            has_more=False,
+            next_before_created_at=None,
+            next_before_message_id=None,
+        )
+    )
+    handler = ChatHistoryHandler(
+        settings=SimpleNamespace(chat_session=SimpleNamespace(history_limit=20)),
+        token_presenter=StubTokenPresenter(),
+        cursor_encrypter=StubCursorEncrypter(
+            decrypted=ChatHistoryCursor(
+                before_created_at=datetime(2026, 4, 12, 10, 30, tzinfo=UTC),
+                before_message_id=9,
+            ),
+            encrypted="cursor-next",
+            decrypt_calls=[],
+            encrypt_calls=[],
+        ),
+        composition=composition,
+    )
+
+    await handler(
+        GetChatHistoryPageRequest(
+            token="token",
+            chat_id=str(chat_id.value),
+            limit=100,
+            cursor=None,
+        )
+    )
+
+    assert composition.requests
+    assert composition.requests[0].limit == 20
+
+tests/presentation/test_chat_membership_self_join_handler.py
+
+from dataclasses import dataclass
+from uuid import UUID
+
+import pytest
+
+from application.compositions import JoinChatMembershipCompositionResponse
+from domain.entities.actor import ActorId
+from domain.entities.chat import ChatId, ContextKind
+from presentation.exceptions import InvalidAccessTokenError
+from presentation.handlers import JoinChatMembershipHandler, JoinChatMembershipRequest
+from presentation.models import ChatMemberJoinedEvent
+from presentation.presenters import AccessAuthInfo
+
+
+class StubTokenPresenter:
+    def __init__(self, user_id: str) -> None:
+        self._user_id = user_id
+
+    def present(self, token: str) -> AccessAuthInfo:
+        return AccessAuthInfo(key_id="key-1", user_id=self._user_id)
+
+
+@dataclass
+class StubComposition:
+    response: JoinChatMembershipCompositionResponse
+    requests: list[object]
+
+    async def __call__(self, request: object) -> JoinChatMembershipCompositionResponse:
+        self.requests.append(request)
+        return self.response
+
+
+@pytest.mark.asyncio
+async def test_join_membership_handler_builds_context_request() -> None:
+    actor_id = ActorId(UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"))
+    chat_id = ChatId(UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"))
+    composition = StubComposition(
+        response=JoinChatMembershipCompositionResponse(
+            chat_id=chat_id,
+            chat_was_created=True,
+            member_was_added=True,
+        ),
+        requests=[],
+    )
+    handler = JoinChatMembershipHandler(
+        token_presenter=StubTokenPresenter(str(actor_id.value)),
+        composition=composition,
+    )
+
+    response = await handler(
+        JoinChatMembershipRequest(
+            token="token",
+            context_kind=ContextKind.DOCUMENT,
+            context_external_id="doc-1",
+        )
+    )
+
+    assert isinstance(response, ChatMemberJoinedEvent)
+    assert response.chat_id == str(chat_id.value)
+    assert response.chat_was_created is True
+    assert response.member_was_added is True
+    assert len(composition.requests) == 1
+    request = composition.requests[0]
+    assert request.context.kind is ContextKind.DOCUMENT
+    assert request.context.external_id == "doc-1"
+    assert request.actor_id == actor_id
+
+
+@pytest.mark.asyncio
+async def test_join_membership_handler_rejects_invalid_user_id_in_token() -> None:
+    composition = StubComposition(
+        response=JoinChatMembershipCompositionResponse(
+            chat_id=ChatId(UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")),
+            chat_was_created=False,
+            member_was_added=False,
+        ),
+        requests=[],
+    )
+    handler = JoinChatMembershipHandler(
+        token_presenter=StubTokenPresenter("not-a-uuid"),
+        composition=composition,
+    )
+
+    with pytest.raises(InvalidAccessTokenError):
+        await handler(
+            JoinChatMembershipRequest(
+                token="token",
+                context_kind=ContextKind.DOCUMENT,
+                context_external_id="doc-1",
+            )
+        )
+    assert composition.requests == []
+
+tests/presentation/test_chat_membership_self_leave_handler.py
+
+from dataclasses import dataclass
+from uuid import UUID
+
+import pytest
+
+from application.compositions import RemoveChatMemberCompositionResponse
+from domain.entities.actor import ActorId
+from domain.entities.chat import ChatId, ContextKind
+from presentation.exceptions import InvalidAccessTokenError
+from presentation.handlers import LeaveChatMembershipHandler, LeaveChatMembershipRequest
+from presentation.models import ChatMemberLeavedEvent
+from presentation.presenters import AccessAuthInfo
+
+
+class StubTokenPresenter:
+    def __init__(self, user_id: str) -> None:
+        self._user_id = user_id
+
+    def present(self, token: str) -> AccessAuthInfo:
+        return AccessAuthInfo(key_id="key-1", user_id=self._user_id)
+
+
+@dataclass
+class StubComposition:
+    response: RemoveChatMemberCompositionResponse
+    requests: list[object]
+
+    async def __call__(self, request: object) -> RemoveChatMemberCompositionResponse:
+        self.requests.append(request)
+        return self.response
+
+
+@pytest.mark.asyncio
+async def test_leave_membership_handler_builds_context_request() -> None:
+    actor_id = ActorId(UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"))
+    chat_id = ChatId(UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"))
+    composition = StubComposition(
+        response=RemoveChatMemberCompositionResponse(
+            chat_id=chat_id,
+            member_was_removed=True,
+            display_name="Alice",
+            public_id="alice@example.com",
+            name="Alice",
+        ),
+        requests=[],
+    )
+    handler = LeaveChatMembershipHandler(
+        token_presenter=StubTokenPresenter(str(actor_id.value)),
+        composition=composition,
+    )
+
+    response = await handler(
+        LeaveChatMembershipRequest(
+            token="token",
+            context_kind=ContextKind.DOCUMENT,
+            context_external_id="doc-1",
+        )
+    )
+
+    assert isinstance(response, ChatMemberLeavedEvent)
+    assert response.chat_id == str(chat_id.value)
+    assert response.member_was_removed is True
+    assert len(composition.requests) == 1
+    request = composition.requests[0]
+    assert request.context.kind is ContextKind.DOCUMENT
+    assert request.context.external_id == "doc-1"
+    assert request.actor_id == actor_id
+
+
+@pytest.mark.asyncio
+async def test_leave_membership_handler_rejects_invalid_user_id_in_token() -> None:
+    composition = StubComposition(
+        response=RemoveChatMemberCompositionResponse(
+            chat_id=ChatId(UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")),
+            member_was_removed=False,
+            display_name="Alice",
+            public_id="alice@example.com",
+            name="Alice",
+        ),
+        requests=[],
+    )
+    handler = LeaveChatMembershipHandler(
+        token_presenter=StubTokenPresenter("not-a-uuid"),
+        composition=composition,
+    )
+
+    with pytest.raises(InvalidAccessTokenError):
+        await handler(
+            LeaveChatMembershipRequest(
+                token="token",
+                context_kind=ContextKind.DOCUMENT,
+                context_external_id="doc-1",
+            )
+        )
+    assert composition.requests == []
+
+tests/presentation/test_cursor_presenter.py
+
+from datetime import UTC, datetime
+
+import pytest
+
+from presentation.exceptions import InvalidCursorError
+from presentation.presenters import ChatHistoryCursor, FernetCursorEncrypter
+
+
+def test_fernet_cursor_encrypter_roundtrip() -> None:
+    encrypter = FernetCursorEncrypter("U6WgwxM_H0F1fvJzDYa0_Ac40mSZ8FGcqqb86QjYgHg=")
+    source = ChatHistoryCursor(
+        before_created_at=datetime(2026, 4, 12, 10, 30, tzinfo=UTC),
+        before_message_id=42,
+    )
+
+    token = encrypter.encrypt(source)
+    restored = encrypter.decrypt(token)
+
+    assert restored == source
+
+
+def test_fernet_cursor_encrypter_rejects_invalid_token() -> None:
+    encrypter = FernetCursorEncrypter("U6WgwxM_H0F1fvJzDYa0_Ac40mSZ8FGcqqb86QjYgHg=")
+
+    with pytest.raises(InvalidCursorError):
+        encrypter.decrypt("invalid-token")

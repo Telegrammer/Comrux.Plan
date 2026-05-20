@@ -18,6 +18,9 @@ class ChatMembershipCommandGateway(Protocol):
     async def add(self, membership: ChatMembership) -> None:
         raise NotImplementedError
 
+    async def remove(self, chat_id: ChatId, actor_id: ActorId) -> None:
+        raise NotImplementedError
+
 
 class ChatMembershipQueryGateway(Protocol):
     async def by_chat_and_actor(

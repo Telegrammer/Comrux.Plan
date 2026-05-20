@@ -1,4 +1,4 @@
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from application.ports.gateways import (
@@ -10,6 +10,7 @@ from application.ports.gateways import (
 from domain.entities.actor import Actor, ActorId
 from domain.entities.chat import ChatId, ChatMembership
 from domain.value_objects import Name
+from infrastructure.exceptions import network_error_aware
 from infrastructure.models import Actor as ActorModel
 from infrastructure.models import ChatMembership as ChatMembershipModel
 
@@ -18,6 +19,7 @@ class SQLAlchemyActorCommandGateway(ActorCommandGateway):
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
 
+    @network_error_aware("Cannot store actor")
     async def add(self, actor: Actor) -> None:
         self._session.add(
             ActorModel(
@@ -33,6 +35,7 @@ class SQLAlchemyActorQueryGateway(ActorQueryGateway):
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
 
+    @network_error_aware("Cannot load actor")
     async def by_id(self, actor_id: ActorId) -> Actor | None:
         stmt = select(ActorModel).where(ActorModel.id == actor_id.value)
         model = await self._session.scalar(stmt)
@@ -49,6 +52,7 @@ class SQLAlchemyChatMembershipCommandGateway(ChatMembershipCommandGateway):
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
 
+    @network_error_aware("Cannot store chat membership")
     async def add(self, membership: ChatMembership) -> None:
         self._session.add(
             ChatMembershipModel(
@@ -59,11 +63,21 @@ class SQLAlchemyChatMembershipCommandGateway(ChatMembershipCommandGateway):
         )
         await self._session.flush()
 
+    @network_error_aware("Cannot delete chat membership")
+    async def remove(self, chat_id: ChatId, actor_id: ActorId) -> None:
+        stmt = delete(ChatMembershipModel).where(
+            ChatMembershipModel.chat_id == chat_id.value,
+            ChatMembershipModel.actor_id == actor_id.value,
+        )
+        await self._session.execute(stmt)
+        await self._session.flush()
+
 
 class SQLAlchemyChatMembershipQueryGateway(ChatMembershipQueryGateway):
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
 
+    @network_error_aware("Cannot load chat membership")
     async def by_chat_and_actor(
         self, chat_id: ChatId, actor_id: ActorId
     ) -> ChatMembership | None:

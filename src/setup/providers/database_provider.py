@@ -27,10 +27,10 @@ class DatabaseProvider(Provider):
     unit_of_work = provide(
         source=UnitOfWorkImpl,
         provides=UnitOfWork,
-        scope=Scope.REQUEST,
+        scope=Scope.SESSION,
     )
 
-    @provide(scope=Scope.REQUEST)
+    @provide(scope=Scope.SESSION)
     async def provide_session(
         self, db_helper: DatabaseHelper, unit_of_work: UnitOfWork
     ) -> AsyncGenerator[AsyncSession, None]:

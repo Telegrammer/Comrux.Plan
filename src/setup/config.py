@@ -27,6 +27,22 @@ class ServiceConfig(BaseModel):
     encryption_key: str
 
 
+class RedisConfig(BaseModel):
+    url: str = "redis://:chat@localhost:6382/0"
+
+
+class AuthConfig(BaseModel):
+    public_key_path: Path = BASE_DIR / "certificates" / "jwt-public.pem"
+    algorithm: str = "RS256"
+
+
+class ChatSessionConfig(BaseModel):
+    history_limit: int = 50
+    debounce_seconds: float = 5.0
+    periodic_seconds: float = 30.0
+    periodic_max_concurrency: int = 20
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=BASE_DIR / ".env_app",
@@ -39,6 +55,9 @@ class Settings(BaseSettings):
     db: DatabaseConfig
     transport: TransportConfig
     service: ServiceConfig
+    redis: RedisConfig = RedisConfig()
+    auth: AuthConfig = AuthConfig()
+    chat_session: ChatSessionConfig = ChatSessionConfig()
 
 
 settings = Settings()

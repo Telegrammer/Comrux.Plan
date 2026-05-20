@@ -5,4 +5,7 @@ from .actor import (
     SQLAlchemyChatMembershipQueryGateway,
 )
 from .chat import SQLAlchemyChatCommandGateway, SQLAlchemyChatQueryGateway
-from .message import SQLAlchemyMessageCommandGateway
+from .message import (
+    SQLAlchemyDurableMessageCommandGateway,
+    SQLAlchemyMessageCommandGateway,
+)
